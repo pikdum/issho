@@ -21,12 +21,15 @@ defmodule Issho.Authority.Ledger do
 
   # A document as the ledger keeps it: with its horizon (for one saved
   # before there was one, its upgrade's "base", else 0, as its receipts
-  # then go back to its epoch's start), and its receipts trimmed to the
-  # latest `keep`. The next transaction saves it.
+  # then go back to its epoch's start), its receipts trimmed to the latest
+  # `keep`, and without the history an older Issho or an upgrade saved
+  # with it ("journal", "initial", "base"), which the authority's window
+  # (`Issho.Authority.Window`) read. The next transaction saves it.
   @spec load(document(), pos_integer()) :: document()
   def load(document, keep) do
     document
     |> Map.put("horizon", document["horizon"] || document["base"] || 0)
+    |> Map.drop(["journal", "initial", "base"])
     |> trim(keep)
   end
 

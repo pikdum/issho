@@ -36,7 +36,7 @@ defmodule Issho.Authority do
 
   use GenServer, restart: :temporary
 
-  alias Issho.Authority.Ledger
+  alias Issho.Authority.{Ledger, Window}
   alias Issho.{Config, Engine, Transaction}
 
   require Logger
@@ -110,10 +110,10 @@ defmodule Issho.Authority do
     do: read(server, {:content_at, epoch, revision}, Keyword.get(opts, :timeout, @read_timeout))
 
   @doc false
-  # Issho.Test.replays?/2: content_at/3 answers the current revision without a replay.
-  @spec replayed(GenServer.server(), String.t(), non_neg_integer()) ::
-          {:ok, term()} | {:error, term()}
-  def replayed(server, epoch, revision), do: read(server, {:replayed, epoch, revision})
+  # Issho.Test.replays?/2: the latest revisions replayed from the oldest
+  # one the authority keeps, to its current content.
+  @spec replay(GenServer.server()) :: {:ok, term()} | {:error, term()}
+  def replay(server), do: read(server, :replay)
 
   # commit/3 and join/2 exit instead: that ends the channel, and the
   # browser's rejoin resends its pending transactions, which receipts keep
@@ -144,6 +144,7 @@ defmodule Issho.Authority do
     with {:ok, loaded} <- store.load(context, id),
          {stored, spec} = initial(loaded, spec),
          {:ok, document} <- document(stored, engine, spec, engine_opts),
+         window = Window.load(document),
          document = Ledger.load(document, config.history),
          {:ok, content} <- Engine.validate(engine, document["state"], engine_opts),
          :ok <- first_save(stored, store, context, id, document, content) do
@@ -159,6 +160,7 @@ defmodule Issho.Authority do
          events: Map.get(spec, :events),
          document: document,
          content: content,
+         window: window,
          members: %{},
          timer: Process.send_after(self(), :expire, config.ttl)
        }}
@@ -181,8 +183,6 @@ defmodule Issho.Authority do
          "epoch" => Transaction.id(),
          "revision" => 0,
          "state" => state,
-         "initial" => state,
-         "journal" => [],
          "receipts" => %{}
        }}
     end
@@ -276,8 +276,9 @@ defmodule Issho.Authority do
     {:reply, content_at_revision(state, epoch, revision), state}
   end
 
-  def handle_call({:replayed, epoch, revision}, _from, state) do
-    {:reply, replayed_content(state, epoch, revision), state}
+  def handle_call(:replay, _from, state) do
+    {engine_state, events} = Window.all(state.window)
+    {:reply, rebuild(state, engine_state, events), state}
   end
 
   def handle_call({:accepted, ids, author}, _from, state),
@@ -324,7 +325,6 @@ defmodule Issho.Authority do
       next =
         document
         |> Map.merge(%{"state" => engine_state, "revision" => revision})
-        |> Map.update!("journal", &(&1 ++ [event]))
         |> Ledger.record(
           transaction["id"],
           %{"digest" => digest, "revision" => revision, "author" => author},
@@ -488,7 +488,13 @@ defmodule Issho.Authority do
            "id" => event["id"],
            "revision" => event["revision"],
            "version" => Issho.Version.new(next["epoch"], event["revision"])
-         }, %{state | document: next, content: content}}
+         },
+         %{
+           state
+           | document: next,
+             content: content,
+             window: Window.push(state.window, event, next["state"])
+         }}
 
       {:error, :conflict} ->
         Logger.warning("Issho: a newer #{state.id} was saved elsewhere; this authority stops")
@@ -509,23 +515,34 @@ defmodule Issho.Authority do
        ),
        do: {:ok, state.content}
 
-  defp content_at_revision(state, epoch, revision), do: replayed_content(state, epoch, revision)
-
-  defp replayed_content(state, epoch, revision) do
-    document = state.document
-    base = Map.get(document, "base", 0)
-
-    if epoch == document["epoch"] and is_integer(revision) and revision >= base and
-         revision <= document["revision"] do
-      # Each transaction as it was accepted: an engine may limit the
-      # operations of one.
-      events = Enum.take(document["journal"], revision - base)
-
-      with {:ok, engine_state} <- replay(state, document["initial"], events),
-           do: Engine.validate(state.engine, engine_state, state.opts)
-    else
-      {:error, :unknown_revision}
+  defp content_at_revision(
+         %{document: %{"epoch" => epoch, "revision" => current}} = state,
+         epoch,
+         revision
+       )
+       when is_integer(revision) and revision < current do
+    case Window.plan(state.window, revision) do
+      {:ok, engine_state, events} -> rebuild(state, engine_state, events)
+      :error -> {:error, :unknown_revision}
     end
+  end
+
+  defp content_at_revision(_state, _epoch, _revision), do: {:error, :unknown_revision}
+
+  # A revision from a checkpoint and the events after it, each transaction
+  # as it was accepted: an engine may limit the operations of one. An
+  # engine that raises gives the reader an error, and the document goes on.
+  defp rebuild(state, engine_state, events) do
+    with {:ok, engine_state} <- replay(state, engine_state, events),
+         do: Engine.validate(state.engine, engine_state, state.opts)
+  rescue
+    error ->
+      Logger.error(
+        "Issho: rebuilding a revision of #{state.id} raised: " <>
+          Exception.format(:error, error, __STACKTRACE__)
+      )
+
+      {:error, :replay_failed}
   end
 
   defp replay(_state, engine_state, []), do: {:ok, engine_state}
