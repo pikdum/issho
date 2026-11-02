@@ -49,8 +49,12 @@ defmodule Issho.Authority do
   unless it is only on the revision it saw (`"if_revision"`), which is
   stale; one made on an epoch before that is refused, `:epoch_mismatch`,
   unless the document applied it: a retry gets its receipt from any epoch.
-  It does so only when that saves at least a quarter of the state and
-  64 KB, and the instance's `:compact` is true (the default).
+  The authority compacts only when that saves at least a quarter of the
+  state and 64 KB, and the instance's `:compact` is true (the default).
+  Each try is a `[:issho, :document, :compact]` telemetry event:
+  measurements `:duration`, and `:bytes_before` and `:bytes_after` (the
+  state's external size), metadata `:instance`, `:document` and
+  `:result` (`:ok`, `:skipped` or `:error`).
 
   Start an authority with `Issho.Documents.open/3`, not directly.
   """

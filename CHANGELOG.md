@@ -7,10 +7,25 @@ and Issho follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-A document no longer grows with its history.
+A document no longer grows with its history, and an idle one sheds what only
+its past needed.
 
 ### Added
 
+- An optional engine callback, `c:Issho.Engine.compact/2`: the state without
+  what only past operations need (a text's deleted characters), keeping the
+  identity of everything that remains. When no session has had a document
+  open for the `:ttl`, its authority compacts it before it stops, and saves
+  it as a new epoch whose `"continues"` names the last, with the same
+  revision, receipts and content. It saves only when that frees at least a
+  quarter of the state and 64 KB, and only when the compacted state gives
+  the same content; telemetry `[:issho, :document, :compact]` reports each
+  attempt. `compact: false` turns it off, and a document without a store
+  never compacts.
+- A transaction made on the epoch a document continues still applies, and
+  goes out on the document's epoch; an `"if_revision"` one is stale, with
+  an exact count. Snapshots carry `"continues"`, and the browser keeps such
+  pending transactions across the reset, and in a draft across a reload.
 - `:history`: how many of a document's latest transactions it keeps the
   receipts of (1,000, at least 20). A transaction with no receipt, made
   on a revision more than that many behind, may be refused with
@@ -53,6 +68,16 @@ A document no longer grows with its history.
 - An engine that raises rebuilding a revision gives the reader `{:error,
   :replay_failed}`, and the document goes on; it stopped the document's
   authority.
+- A retry of a transaction the document applied is answered with its
+  receipt whatever epoch it was made on, conditional or not; one from an
+  epoch the document no longer had was refused, `:epoch_mismatch`, though
+  it had been applied.
+- On a reset to another epoch, the browser drops the pending transactions
+  the server says it accepted, and refuses only the rest; it refused them
+  all, so an editor froze over work that was saved.
+- A change refused as `"epoch_mismatch"` opens the document again. The
+  browser stayed on the epoch the server no longer had, and every later
+  change was refused the same way.
 
 ## [0.5.0] - 2026-10-26
 
