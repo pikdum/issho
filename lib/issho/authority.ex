@@ -38,7 +38,8 @@ defmodule Issho.Authority do
   revision and receipts, with a journal that starts from the compacted
   state. A transaction made on the epoch it continues still applies,
   unless it is only on the revision it saw (`"if_revision"`), which is
-  stale; one made on an epoch before that is refused, `:epoch_mismatch`.
+  stale; one made on an epoch before that is refused, `:epoch_mismatch`,
+  unless the document applied it: a retry gets its receipt from any epoch.
   It does so only when that saves at least a quarter of the state and
   64 KB.
 
@@ -321,7 +322,7 @@ defmodule Issho.Authority do
     document = state.document
     author = by.key
 
-    with :ok <- check(document, transaction),
+    with :ok <- check(document, transaction, author),
          digest = Transaction.digest(transaction, author),
          :new <- Ledger.check(document, transaction, digest),
          :ok <- unchanged(document, transaction),
@@ -451,15 +452,26 @@ defmodule Issho.Authority do
       )
   end
 
-  # A conditional transaction from another epoch is stale, as one from
-  # an older revision is; anything else is the envelope's to refuse.
-  defp check(document, transaction) do
+  # The envelope's to refuse, but for a transaction of another epoch.
+  defp check(document, transaction, author) do
     case Transaction.check(transaction, epoch(document, transaction), document["revision"]) do
-      {:error, :epoch_mismatch} = error ->
-        if Transaction.conditional?(transaction), do: stale(document, transaction), else: error
+      {:error, :epoch_mismatch} -> other_epoch(document, transaction, author)
+      result -> result
+    end
+  end
 
-      result ->
-        result
+  # A retry of a transaction the document applied, made on any epoch, gets
+  # its receipt; a conditional one is stale, as one from an older revision
+  # is; anything else is refused.
+  defp other_epoch(document, transaction, author) do
+    case Ledger.check(document, transaction, Transaction.digest(transaction, author)) do
+      {:duplicate, _revision} = duplicate ->
+        duplicate
+
+      _other ->
+        if Transaction.conditional?(transaction),
+          do: stale(document, transaction),
+          else: {:error, :epoch_mismatch}
     end
   end
 
