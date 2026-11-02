@@ -346,7 +346,10 @@ export class SharedDocument {
       this.persist();
       this.emit({ type: "refused", transaction, reason: error.reason });
       this.emit({ type: "change", state: this.view, origin: "reset" });
-      this.pump();
+      // The document has an epoch this copy did not hear of: the room opens
+      // it again, and its reset sends what can still go.
+      if (error.reason === "epoch_mismatch") this.outOfStep("epoch_mismatch");
+      else this.pump();
     }
     // A connection failure: the transaction waits for the reconnect, whose
     // reset sends it again.
