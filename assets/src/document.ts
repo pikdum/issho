@@ -37,9 +37,16 @@ export interface Snapshot {
   id: string;
   engine: string;
   epoch: string;
+  /** The epoch this one continues (a compaction): its transactions still apply. */
+  continues?: string;
   revision: number;
   state: State;
   accepted?: string[];
+}
+
+/** Whether a pending transaction can still go to a document at this snapshot: it is of its epoch, or of the one it continues. */
+export function carries(snapshot: Snapshot, transaction: Transaction): boolean {
+  return transaction.epoch === snapshot.epoch || (snapshot.continues !== undefined && transaction.epoch === snapshot.continues);
 }
 
 export interface Receipt {
@@ -75,8 +82,8 @@ export interface DocumentOptions {
   persist?: (snapshot: Snapshot, pending: Transaction[]) => void;
   /**
    * Pending transactions kept from before (a draft), of the snapshot's
-   * epoch: those the snapshot's `accepted` does not name are replayed and
-   * sent.
+   * epoch or the one it continues: those the snapshot's `accepted` does
+   * not name are replayed and sent.
    */
   pending?: Transaction[];
   /**
@@ -113,7 +120,7 @@ export class SharedDocument {
 
     if (options.pending && options.pending.length > 0) {
       const accepted = new Set(snapshot.accepted ?? []);
-      this.queue = options.pending.filter((tx) => tx.epoch === snapshot.epoch && !accepted.has(tx.id));
+      this.queue = options.pending.filter((tx) => carries(snapshot, tx) && !accepted.has(tx.id));
       // A draft may have been sent before the reload.
       for (const tx of this.queue) this.sent.add(tx.id);
       this.replay();
@@ -203,18 +210,19 @@ export class SharedDocument {
   /**
    * The document as the server has it now, after a reconnect or when this
    * copy was out of step. `accepted` names pending transactions the server
-   * already has; the others are sent again, unchanged.
+   * already has, whatever their epoch; the others are sent again,
+   * unchanged, when they are of its epoch or the one it continues.
    */
   reset(snapshot: Snapshot): void {
     const accepted = new Set(snapshot.accepted ?? []);
-    const epochChanged = snapshot.epoch !== this.accepted.epoch;
     this.accepted = { ...snapshot };
     this.sending = null;
     this.acked.clear();
 
-    // Transactions of another epoch can never apply: they are refused here.
-    const stale = epochChanged ? this.queue : [];
-    this.queue = epochChanged ? [] : this.queue.filter((tx) => !accepted.has(tx.id));
+    // Transactions of any other epoch can never apply: they are refused here.
+    const remaining = this.queue.filter((tx) => !accepted.has(tx.id));
+    const stale = remaining.filter((tx) => !carries(snapshot, tx));
+    this.queue = remaining.filter((tx) => carries(snapshot, tx));
     if (this.batching && !this.queue.some((tx) => tx.id === this.batching?.id)) this.endBatch();
     this.sent = new Set(this.queue.filter((tx) => this.sent.has(tx.id)).map((tx) => tx.id));
     for (const transaction of stale) this.emit({ type: "refused", transaction, reason: "epoch_mismatch" });
