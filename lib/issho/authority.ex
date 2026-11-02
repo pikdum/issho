@@ -41,6 +41,16 @@ defmodule Issho.Authority do
   When no session has used the document for the instance's `:ttl` (30
   seconds), the authority stops; the document stays in the store.
 
+  Before it stops, when the document's engine compacts
+  (`c:Issho.Engine.compact/2`), the authority saves the document again
+  without what only its past needed (a text's deleted characters), as a
+  new epoch that continues this one: the same content, revision and
+  receipts. A transaction made on the epoch it continues still applies,
+  unless it is only on the revision it saw (`"if_revision"`), which is
+  stale; one made on an epoch before that is refused, `:epoch_mismatch`.
+  It does so only when that saves at least a quarter of the state and
+  64 KB, and the instance's `:compact` is true (the default).
+
   Start an authority with `Issho.Documents.open/3`, not directly.
   """
 
@@ -52,6 +62,11 @@ defmodule Issho.Authority do
   require Logger
 
   @read_timeout 5_000
+
+  # A compaction is worth a new epoch when it saves at least this share
+  # of the state, and at least this many bytes.
+  @compact_share 4
+  @compact_bytes 65_536
 
   @doc false
   def start_link(opts) do
@@ -328,10 +343,12 @@ defmodule Issho.Authority do
          {:ok, content} <- Engine.validate(state.engine, engine_state, state.opts),
          revision = document["revision"] + 1,
          :ok <- hook(state, transaction, by, engine_state, revision) do
+      # Of the document's epoch, whichever its author made it on (the one
+      # this continues): every browser applies it.
       event =
         transaction
-        |> Map.take(["id", "epoch", "base_revision", "ops"])
-        |> Map.merge(%{"revision" => revision, "author" => author})
+        |> Map.take(["id", "base_revision", "ops"])
+        |> Map.merge(%{"epoch" => document["epoch"], "revision" => revision, "author" => author})
 
       next =
         document
@@ -344,12 +361,14 @@ defmodule Issho.Authority do
 
       persist(state, next, content, event, by)
     else
+      # Its version is of the epoch it was made on, which may be one this
+      # document continues.
       {:duplicate, revision} ->
         {:ok,
          %{
            "id" => transaction["id"],
            "revision" => revision,
-           "version" => Issho.Version.new(document["epoch"], revision),
+           "version" => Issho.Version.new(transaction["epoch"], revision),
            "duplicate" => true
          }, state}
 
@@ -429,7 +448,7 @@ defmodule Issho.Authority do
   # A conditional transaction from another epoch is stale, as one from
   # an older revision is; anything else is the envelope's to refuse.
   defp check(document, transaction) do
-    case Transaction.check(transaction, document["epoch"], document["revision"]) do
+    case Transaction.check(transaction, epoch(document, transaction), document["revision"]) do
       {:error, :epoch_mismatch} = error ->
         if Transaction.conditional?(transaction), do: stale(document, transaction), else: error
 
@@ -437,6 +456,14 @@ defmodule Issho.Authority do
         result
     end
   end
+
+  # The epoch a transaction is checked on: the document's, or the one it
+  # continues for an unconditional transaction made before a compaction.
+  defp epoch(%{"continues" => continued} = document, %{"epoch" => continued} = transaction) do
+    if Transaction.conditional?(transaction), do: document["epoch"], else: continued
+  end
+
+  defp epoch(document, _transaction), do: document["epoch"]
 
   # Only on the revision it saw: still the document's.
   defp unchanged(%{"revision" => revision}, %{"if_revision" => revision}), do: :ok
@@ -449,10 +476,11 @@ defmodule Issho.Authority do
 
   # The document's version now, and what changed since the author saw it:
   # each change's revision and author (never its operations), the latest
-  # @changes whose receipts it keeps. Revisions are dense, so the count is
-  # exact; nil for another epoch.
+  # @changes whose receipts it keeps. Revisions are dense, and go on across
+  # a compaction, so the count is exact; nil for another epoch.
   defp stale(document, %{"epoch" => epoch, "if_revision" => seen}) do
-    count = if epoch == document["epoch"], do: document["revision"] - seen
+    line? = epoch == document["epoch"] or (is_binary(epoch) and epoch == document["continues"])
+    count = if line? and seen <= document["revision"], do: document["revision"] - seen
     changes = if count, do: Ledger.since(document, seen, @changes), else: []
 
     {:error,
@@ -566,13 +594,12 @@ defmodule Issho.Authority do
   end
 
   defp snapshot_of(state) do
-    %{
+    state.document
+    |> Map.take(["engine", "epoch", "continues", "revision"])
+    |> Map.merge(%{
       "id" => state.id,
-      "engine" => state.document["engine"],
-      "epoch" => state.document["epoch"],
-      "revision" => state.document["revision"],
       "state" => Engine.snapshot(state.engine, state.document["state"])
-    }
+    })
   end
 
   @impl true
@@ -591,10 +618,91 @@ defmodule Issho.Authority do
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state),
     do: {:noreply, member_gone(%{state | members: Map.delete(state.members, pid)})}
 
-  def handle_info(:expire, %{members: members} = state) when map_size(members) == 0,
-    do: {:stop, :normal, state}
+  def handle_info(:expire, %{members: members} = state) when map_size(members) == 0 do
+    if compacts?(state), do: compact(state)
+    {:stop, :normal, state}
+  end
 
   def handle_info(:expire, state), do: {:noreply, state}
+
+  defp compacts?(state) do
+    state.config.compact and state.store != Issho.Store.None and Engine.compacts?(state.engine)
+  end
+
+  # The idle document, saved as a new epoch that continues this one,
+  # without what only its past needed. No session has it open, so no page
+  # holds pending work on this epoch but one that was away, whose
+  # transactions still apply. At most once an idle period: the authority
+  # stops right after.
+  defp compact(state) do
+    started = System.monotonic_time()
+    {result, sizes} = compaction(state)
+
+    :telemetry.execute(
+      [:issho, :document, :compact],
+      Map.put(sizes, :duration, System.monotonic_time() - started),
+      %{instance: state.config.name, document: state.id, result: result}
+    )
+  end
+
+  defp compaction(%{document: document} = state) do
+    case state.engine.compact(document["state"], state.opts) do
+      {:ok, compacted} ->
+        sizes = %{
+          bytes_before: :erlang.external_size(document["state"]),
+          bytes_after: :erlang.external_size(compacted)
+        }
+
+        {save_compacted(state, compacted, sizes), sizes}
+
+      {:error, reason} ->
+        Logger.warning("Issho: #{state.id} did not compact: #{inspect(reason)}")
+        {:error, %{}}
+    end
+  rescue
+    error ->
+      Logger.error(
+        "Issho: compacting #{state.id} raised: " <>
+          Exception.format(:error, error, __STACKTRACE__)
+      )
+
+      {:error, %{}}
+  end
+
+  # A store that answers :conflict has a newer document (saved from
+  # another node), or no longer takes this one: not an error.
+  defp save_compacted(%{document: document} = state, compacted, sizes) do
+    kept = state.content
+    next = %{document | "epoch" => Transaction.id(), "state" => compacted}
+    next = Map.put(next, "continues", document["epoch"])
+    expected = {document["epoch"], document["revision"]}
+
+    with :ok <- worth(sizes),
+         {:ok, ^kept} <- Engine.validate(state.engine, compacted, state.opts),
+         :ok <- state.store.save(state.context, state.id, expected, next, kept) do
+      :ok
+    else
+      :too_little ->
+        :skipped
+
+      {:error, :conflict} ->
+        :skipped
+
+      {:ok, _content} ->
+        Logger.error("Issho: #{state.id} compacted to other content; it is kept as it was")
+        :error
+
+      {:error, reason} ->
+        Logger.error("Issho: #{state.id} was not saved compacted: #{inspect(reason)}")
+        :error
+    end
+  end
+
+  defp worth(%{bytes_before: before, bytes_after: compacted}) do
+    if before - compacted >= max(div(before, @compact_share), @compact_bytes),
+      do: :ok,
+      else: :too_little
+  end
 
   # The last session gone: the document goes after the TTL, unless one comes.
   defp member_gone(%{members: members} = state) when map_size(members) == 0,

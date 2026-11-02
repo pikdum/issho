@@ -18,6 +18,7 @@ defmodule Issho.Config do
     presence: true,
     ttl: 30_000,
     history: 1_000,
+    compact: true,
     awareness_interval: 50,
     awareness_full_every: 100,
     max_document_bytes: 16_000_000,
@@ -56,6 +57,7 @@ defmodule Issho.Config do
       do: raise(ArgumentError, "Issho needs :endpoint or :secret_key_base, to sign join tokens")
 
     check_history!(Keyword.get(opts, :history, 1_000))
+    check_compact!(Keyword.get(opts, :compact, true))
     check_on_mention!(opts[:on_mention])
     check_coalesce!(Keyword.get(opts, :coalesce, %{}))
     struct!(__MODULE__, opts)
@@ -80,6 +82,9 @@ defmodule Issho.Config do
 
   defp check_history!(_keep),
     do: raise(ArgumentError, "Issho's :history is a number of transactions, at least 20")
+
+  defp check_compact!(compact) when is_boolean(compact), do: :ok
+  defp check_compact!(_compact), do: raise(ArgumentError, "Issho's :compact is true or false")
 
   defp check_on_mention!(nil), do: :ok
   defp check_on_mention!({module, function}) when is_atom(module) and is_atom(function), do: :ok

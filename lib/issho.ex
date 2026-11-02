@@ -33,6 +33,10 @@ defmodule Issho do
       answered with its revision again; a transaction made before them
       without a receipt cannot be told from one already applied, and is
       refused, `{:error, :expired}`, never applied twice.
+    * `:compact`: whether an idle document whose engine compacts
+      (`c:Issho.Engine.compact/2`) is saved without what only its past
+      needed, as a new epoch that continues the last (`true`). See
+      `Issho.Authority`.
     * `:awareness_interval`: milliseconds between awareness frames (50).
     * `:awareness_max_bytes`: the largest awareness state of a session, as
       JSON (64 KB).
