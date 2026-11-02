@@ -135,6 +135,30 @@ test("a reconnect opens documents again and sends only what the server lacks", a
   assert.deepEqual(doc.state, { n: 3 });
 });
 
+test("a change refused for its epoch opens the document again, on the epoch the server has", async () => {
+  const transport = new FakeTransport();
+  const room = new Room(transport, { self: "ada" });
+  await room.connect();
+  const doc = await room.open("board:1");
+  const refused: string[] = [];
+  doc.on((event) => {
+    if (event.type === "refused") refused.push(event.reason);
+  });
+
+  // The document was replaced under a browser that did not hear of it.
+  transport.doc("board:1").epoch = "e2";
+  doc.change([{ op: "set", path: ["first"], value: 1 }]);
+  await tick();
+  assert.deepEqual(refused, ["epoch_mismatch"]);
+  assert.equal(doc.epoch, "e2");
+
+  doc.change([{ op: "set", path: ["second"], value: 2 }]);
+  await tick();
+  assert.deepEqual(refused, ["epoch_mismatch"]);
+  assert.deepEqual(transport.doc("board:1").state, { second: 2 });
+  assert.deepEqual(doc.state, { second: 2 });
+});
+
 test("awareness frames become peers; a dropped connection forgets them", async () => {
   const transport = new FakeTransport();
   const room = new Room(transport, { self: "ada" });

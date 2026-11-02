@@ -289,6 +289,20 @@ test("pending work of the epoch a compaction continues stays, and goes as it was
   assert.equal(ada.pending[0].epoch, "e2");
 });
 
+test("a transaction refused for its epoch puts the copy out of step", async () => {
+  const server = new FakeServer();
+  const ada = server.connect("ada");
+  const reasons: string[] = [];
+  ada.on((event) => {
+    if (event.type === "out_of_step") reasons.push(event.reason);
+  });
+
+  server.epoch = "e2";
+  ada.change([inc("n")]);
+  await server.settle();
+  assert.deepEqual(reasons, ["epoch_mismatch"]);
+});
+
 test("pending work of an epoch before the one continued is refused", () => {
   const server = new FakeServer();
   const ada = server.connect("ada");
