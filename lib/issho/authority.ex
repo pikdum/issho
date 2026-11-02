@@ -16,13 +16,23 @@ defmodule Issho.Authority do
     5. only then answers the author and broadcasts the transaction.
 
   The stored document is the engine's state with Issho's envelope: the
-  engine's name and version, an epoch, a revision, the state the epoch
-  began with, a journal of the accepted transactions, and their receipts.
-  The journal can rebuild any revision of the epoch (`content_at/3`), so a
-  form can publish exactly the revision a person saw. The current revision
-  needs no rebuilding: its content is the one the authority keeps. (An
-  upgraded document that kept no journal rebuilds the revisions from its
-  upgrade on.)
+  engine's name and version, an epoch, a revision, and the receipts of
+  its latest transactions (the instance's `:history`, 1,000). A retry of
+  one of them gets its revision again. A transaction with no receipt made
+  on a revision before them cannot be told from one whose receipt was
+  dropped: it is refused, `{:error, :expired}`, and never applied twice.
+  The document does not grow with its history; for a record of every
+  change, save each one from the document's `:on_transaction` hook.
+
+  The authority keeps its latest revisions in memory, and rebuilds any of
+  them from fewer than 128 transactions (`content_at/3`), so a form can
+  publish exactly the revision a person saw. It keeps at least the latest
+  128 accepted since it started, and at most 256; an older revision, or
+  one from before it started, is `{:error, :unknown_revision}`. The
+  current revision needs no rebuilding: its content is the one the
+  authority keeps. A document an earlier Issho saved with its journal
+  opens without it, and rebuilds that journal's revisions when it has
+  fewer than 128 transactions.
 
   A store that answers `{:error, :conflict}` means another process saved
   meanwhile (a node that lost touch with the cluster): this one stops, and
@@ -70,7 +80,7 @@ defmodule Issho.Authority do
 
   @doc """
   Commits a transaction of an author: its identity (`Issho.Identity`), or
-  only its key. The key is what the journal and the receipts keep; the
+  only its key. The key is what its receipt keeps; the
   identity, when given, is what the document's hook gets as `:by` (who
   made the change: a person, an agent and whom it acts for, a service).
   Gives `{:ok, %{"id" => id, "revision" => revision, "version" => token}}`
@@ -99,10 +109,11 @@ defmodule Issho.Authority do
   def content(server), do: read(server, :content)
 
   @doc """
-  The content of an accepted revision of the epoch. `{:error, :timeout}`
-  when the authority does not answer within the `:timeout` option, in
-  milliseconds (5,000), and `{:error, :unavailable}` when it is gone,
-  rather than an exit.
+  The content of an accepted revision of the epoch: the current one, or
+  one of the latest it keeps; `{:error, :unknown_revision}` for another.
+  `{:error, :timeout}` when the authority does not answer within the
+  `:timeout` option, in milliseconds (5,000), and `{:error, :unavailable}`
+  when it is gone, rather than an exit.
   """
   @spec content_at(GenServer.server(), String.t(), non_neg_integer(), keyword()) ::
           {:ok, term()} | {:error, term()}

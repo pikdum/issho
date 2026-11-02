@@ -7,12 +7,52 @@ and Issho follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+A document no longer grows with its history.
+
+### Added
+
+- `:history`: how many of a document's latest transactions it keeps the
+  receipts of (1,000, at least 20). A transaction with no receipt, made
+  on a revision more than that many behind, may be refused with
+  `{:error, :expired}`: the document cannot tell it from one whose
+  receipt it dropped, so it never applies it twice.
+- `Issho.content/5` takes `:timeout`, in milliseconds (5,000).
+
+### Changed
+
+- Issho no longer saves a document's journal or the state its epoch
+  began with: the stored document is its state and the receipts of its
+  latest transactions. Each commit saved the whole history again, so a
+  long draft's commits slowed as it grew, and it stopped taking changes
+  at `:max_document_bytes`. With the map engine, 2,000 transactions that
+  each set one of 40 short strings made a stored document of 943 KB
+  (Erlang's external size), 472 bytes more with each; it now stays at or
+  under 208 KB.
+- `Issho.content/4` reads the latest revisions only: at least the latest
+  128 since the document's authority started, rebuilt in memory from
+  fewer than 128 transactions. An older revision, or one from before the
+  authority started, is `{:error, :unknown_revision}`. A document saved
+  with its journal opens without it, and saves without it at its next
+  transaction; a journal of fewer than 128 transactions is still read.
+- A refused `"if_revision"` transaction counts every change since,
+  whether or not their receipts are kept; it lists the latest 20.
+- `Issho.Test.replays?/2` replays the transactions the authority keeps,
+  up to the latest 256.
+
 ### Fixed
 
 - `Issho.content/4` (and `Issho.Authority.content_at/3`) answers the
   current revision with the content the authority keeps, without replaying
   the journal. Publishing what a person saw replayed the whole epoch, so a
   form on a document with a long history took seconds and could time out.
+- Reading a document (`Issho.content/4`, `Issho.Authority.snapshot/1`,
+  `content/1` and `content_at/3`) answers `{:error, :timeout}` or
+  `{:error, :unavailable}` when its authority does not answer or is gone,
+  instead of exiting the reader: a LiveView that published a draft
+  crashed with it.
+- An engine that raises rebuilding a revision gives the reader `{:error,
+  :replay_failed}`, and the document goes on; it stopped the document's
+  authority.
 
 ## [0.5.0] - 2026-10-26
 

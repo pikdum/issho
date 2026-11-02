@@ -92,7 +92,7 @@ each other's keys.
 Every change has an author, an `Issho.Identity`: a person, an agent and
 whom it acts for (`on_behalf_of`), or a service (your server's own,
 `"server"`). A document's hook gets it as `:by`, beside the `:author`
-key the journal keeps; a component gives it to its app's callbacks the
+key its receipt keeps; a component gives it to its app's callbacks the
 same way, so an app knows who did what, whichever component it was.
 Your server's changes name theirs: `Issho.transact/4`'s `:author`, an
 actor or a key.

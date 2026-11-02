@@ -16,6 +16,13 @@ defmodule Issho.Transaction do
   revision and applied once. A different transaction with an id already
   used is refused.
 
+  A document keeps the receipts of its latest transactions only (the
+  instance's `:history`, 1,000). A transaction with no receipt, made on a
+  revision more than that many behind, may be refused with `{:error,
+  :expired}`: the document cannot tell it from one whose receipt it
+  dropped, so it never applies it twice. One made on any of the latest
+  `:history` revisions is never refused this way.
+
   ## Only on what the author saw
 
   Without `"if_revision"`, a transaction on an older revision applies to
@@ -24,8 +31,8 @@ defmodule Issho.Transaction do
   that revision of that epoch: when anyone changed it since, or it began
   a new epoch, the whole transaction is refused, before its operations or
   the document's hook run, with `{:error, {:stale, details}}`: the
-  document's version now, and the changes since (their revisions and
-  authors, the latest 20) when the journal still holds them. An agent
+  document's version now, how many changes were made since, and the
+  latest 20 of them (their revisions and authors). An agent
   that read the document, then thought, changes what it read, or reads
   it again (`Issho.Version`).
 

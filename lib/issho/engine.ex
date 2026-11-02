@@ -16,7 +16,7 @@ defmodule Issho.Engine do
   any Erlang term: a struct of your own.
 
   Everything outside the engine treats operations as opaque: the authority,
-  the store, receipts, the journal and the offline queue see only a
+  the store, receipts and the offline queue see only a
   transaction's id, its base revision and its author.
 
   ## Callbacks
@@ -36,8 +36,8 @@ defmodule Issho.Engine do
       engine, or one saved before Issho in a library's own format, and
       gives its `"state"`, `"epoch"` and `"revision"`, and its
       `"receipts"` if it kept them. With an `"initial"` state and a
-      `"journal"` of the transactions since, earlier revisions can be
-      rebuilt. Keep the epoch and revision the store has, so that the
+      `"journal"` of fewer than 128 transactions since, those revisions
+      can be rebuilt. Keep the epoch and revision the store has, so that the
       first save after the upgrade finds the version it expects.
       The upgraded document is saved with the next transaction; until
       then the store keeps it as it was. Without it, such a document does

@@ -41,7 +41,9 @@ Presence; a full frame every few seconds heals a missed one.
 ## Documents and engines
 
 An authority owns the envelope: the engine's name and version, an epoch,
-a revision, the state the epoch began with, the journal and the receipts.
+a revision, and the receipts of the latest transactions. It keeps no
+journal: its latest revisions are rebuilt in memory, for a form that
+publishes the revision a person saw.
 The engine owns the state and its operations, and is pure, so the same
 operations give the same state on every node, in a replay, and in the
 browser's twin of the engine.

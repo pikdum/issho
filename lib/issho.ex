@@ -145,7 +145,10 @@ defmodule Issho do
 
   @doc """
   The content of a document's revision, for a form that publishes exactly
-  what a person saw: the `epoch` and `revision` the browser posts.
+  what a person saw: the `epoch` and `revision` the browser posts. The
+  current revision, or one of the latest the document's authority keeps
+  (at least 128 since it started, `Issho.Authority`); `{:error,
+  :unknown_revision}` for another (ask the person to save again).
   `{:error, :timeout}` when the document's authority does not answer
   within the `:timeout` option, in milliseconds (5,000), and `{:error,
   :unavailable}` when it is gone: never an exit.
