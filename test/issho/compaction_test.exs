@@ -221,6 +221,53 @@ defmodule Issho.CompactionTest do
     assert content(pid) == %{"n" => 1}
   end
 
+  test "a retry gets its revision across any number of compactions, conditional or not, and applies once",
+       %{instance: instance} do
+    {id, pid} = open(instance)
+    {:ok, %{"epoch" => first, "revision" => seen}} = Authority.snapshot(pid)
+    increment = [%{"op" => "increment", "path" => ["n"], "by" => 1}]
+
+    plain = %{
+      "id" => Transaction.id(),
+      "epoch" => first,
+      "base_revision" => seen,
+      "ops" => increment
+    }
+
+    {:ok, %{"revision" => 1}} = Authority.commit(pid, plain, "user:ada")
+
+    conditional = %{
+      "id" => Transaction.id(),
+      "epoch" => first,
+      "base_revision" => 1,
+      "if_revision" => 1,
+      "ops" => increment
+    }
+
+    {:ok, %{"revision" => 2}} = Authority.commit(pid, conditional, "user:ada")
+
+    pid =
+      Enum.reduce(1..2, pid, fn _round, pid ->
+        commit(pid, [throw_away(100_000)])
+        leave(pid)
+        rejoin(instance, id, pid)
+      end)
+
+    assert {:ok, %{"epoch" => third, "continues" => second}} = Authority.snapshot(pid)
+    refute first in [second, third]
+
+    for {t, revision} <- [{plain, 1}, {conditional, 2}] do
+      assert {:ok, %{"revision" => ^revision, "duplicate" => true, "version" => version}} =
+               Authority.commit(pid, t, "user:ada")
+
+      assert version == Issho.Version.new(first, revision)
+    end
+
+    new = %{plain | "id" => Transaction.id()}
+    assert {:error, :epoch_mismatch} = Authority.commit(pid, new, "user:ada")
+    assert content(pid) == %{"n" => 2}
+  end
+
   test "an if_revision transaction of the epoch before is stale, and counts the changes since",
        %{instance: instance} do
     {id, pid} = open(instance)
