@@ -2,6 +2,8 @@ defmodule Issho.HistoryTest do
   # A document keeps the receipts of its latest transactions (the
   # instance's :history), not of every one: a transaction it can no longer
   # tell from one it applied is refused, :expired, and never applied twice.
+  # Its authority rebuilds its latest revisions from memory; the store
+  # keeps no journal.
   use ExUnit.Case, async: true
   use ExUnitProperties
 
@@ -13,7 +15,27 @@ defmodule Issho.HistoryTest do
     @impl true
     def authorize(_identity, _room, _action), do: :ok
     @impl true
-    def document(_identity, _id), do: {:ok, %{engine: Issho.Engine.Map, initial: %{}}}
+    def document(_identity, "doc:" <> _), do: {:ok, %{engine: Issho.Engine.Map, initial: %{}}}
+    def document(_identity, _id), do: {:error, :not_found}
+  end
+
+  defmodule ObservedEngine do
+    @moduledoc false
+    # The map engine, telling the test process each time it applies a
+    # transaction's operations, and raising once its :fuse (an Agent) is
+    # blown.
+    @behaviour Issho.Engine
+    alias Issho.Engine.Map, as: MapEngine
+
+    def name, do: "observed"
+    def version, do: 1
+    defdelegate init(initial, opts), to: MapEngine
+
+    def apply(state, ops, opts) do
+      send(Keyword.fetch!(opts, :observer), :applied)
+      if opts[:fuse] && Agent.get(opts[:fuse], & &1), do: raise("blown")
+      MapEngine.apply(state, ops, opts)
+    end
   end
 
   setup do
@@ -203,6 +225,163 @@ defmodule Issho.HistoryTest do
     {:ok, _} = Authority.commit(pid, tx(pid), "user:ada")
     {:ok, saved} = Store.Memory.load(store, id)
     assert map_size(saved["receipts"]) in 20..25
+  end
+
+  defp set_n(pid, n) do
+    {:ok, %{"epoch" => epoch, "revision" => revision}} = Authority.snapshot(pid)
+
+    %{
+      "id" => Transaction.id(),
+      "epoch" => epoch,
+      "base_revision" => revision,
+      "ops" => [%{"op" => "set", "path" => ["n"], "value" => n}]
+    }
+  end
+
+  defp observed(instance, opts \\ []) do
+    id = "canvas:" <> Transaction.id()
+    spec = %{engine: ObservedEngine, opts: [observer: self()] ++ opts, initial: %{}, store: :none}
+    {:ok, pid} = Documents.open(instance, id, nil, spec: spec)
+    {id, pid}
+  end
+
+  # How many transactions the engine applied since last asked.
+  defp applies(count \\ 0) do
+    receive do
+      :applied -> applies(count + 1)
+    after
+      0 -> count
+    end
+  end
+
+  test "rebuilds each of the latest 128 revisions from at most 127 transactions, and no older one",
+       %{instance: instance} do
+    {id, pid} = observed(instance)
+    {:ok, %{"epoch" => epoch}} = Authority.snapshot(pid)
+    for n <- 1..300, do: {:ok, %{"revision" => ^n}} = Authority.commit(pid, set_n(pid, n), "u")
+    applies()
+
+    replays =
+      for revision <- 172..299 do
+        assert {:ok, %{"n" => ^revision}} = Authority.content_at(pid, epoch, revision)
+        applies()
+      end
+
+    assert Enum.max(replays) <= 127
+    assert {:ok, %{"n" => 300}} = Authority.content_at(pid, epoch, 300)
+    assert applies() == 0
+    assert {:error, :unknown_revision} = Authority.content_at(pid, epoch, 0)
+    assert Issho.Test.replays?(instance, id)
+  end
+
+  test "the store keeps the state and the latest receipts, never the journal",
+       %{instance: instance, store: store} do
+    {id, pid} = open(instance)
+    {:ok, created} = Store.Memory.load(store, id)
+    advance(pid, 3)
+    {:ok, saved} = Store.Memory.load(store, id)
+
+    for document <- [created, saved],
+        key <- ["journal", "initial", "base"],
+        do: refute(Map.has_key?(document, key))
+  end
+
+  test "a document saved with a short journal opens without it, and rebuilds the revisions it holds",
+       %{instance: instance, store: store} do
+    id = "doc:" <> Transaction.id()
+
+    journal =
+      for revision <- 1..3 do
+        %{
+          "id" => "t#{revision}",
+          "epoch" => "e1",
+          "base_revision" => revision - 1,
+          "ops" => [%{"op" => "set", "path" => ["n"], "value" => revision}],
+          "revision" => revision,
+          "author" => "u"
+        }
+      end
+
+    stored = %{
+      "engine" => "map",
+      "engine_version" => 2,
+      "epoch" => "e1",
+      "revision" => 3,
+      "state" => %{"n" => 3},
+      "initial" => %{},
+      "journal" => journal,
+      "receipts" => %{}
+    }
+
+    :ok = Store.Memory.save(store, id, nil, stored, %{"n" => 3})
+    {:ok, pid} = Documents.open(instance, id)
+
+    assert {:ok, %{}} = Authority.content_at(pid, "e1", 0)
+    assert {:ok, %{"n" => 2}} = Authority.content_at(pid, "e1", 2)
+
+    {:ok, %{"revision" => 4}} = Authority.commit(pid, set_n(pid, 4), "u")
+    {:ok, saved} = Store.Memory.load(store, id)
+    for key <- ["journal", "initial", "base"], do: refute(Map.has_key?(saved, key))
+    assert {:ok, %{"n" => 2}} = Authority.content_at(pid, "e1", 2)
+  end
+
+  test "a document saved with a long journal opens without replaying it, and rebuilds from at most 127",
+       %{instance: instance} do
+    id = "canvas:" <> Transaction.id()
+
+    journal =
+      for revision <- 1..200 do
+        %{
+          "id" => "t#{revision}",
+          "epoch" => "e1",
+          "base_revision" => revision - 1,
+          "ops" => [%{"op" => "set", "path" => ["n"], "value" => revision}],
+          "revision" => revision,
+          "author" => "u"
+        }
+      end
+
+    stored = %{
+      "engine" => "observed",
+      "engine_version" => 1,
+      "epoch" => "e1",
+      "revision" => 200,
+      "state" => %{"n" => 200},
+      "initial" => %{"n" => 0},
+      "journal" => journal,
+      "receipts" => %{}
+    }
+
+    store = start_supervised!({Store.Memory, name: :"Issho.HistoryTest.Legacy#{id}"})
+    :ok = Store.Memory.save(store, id, nil, stored, %{"n" => 200})
+    spec = %{engine: ObservedEngine, opts: [observer: self()], store: {Store.Memory, store}}
+    {:ok, pid} = Documents.open(instance, id, nil, spec: spec)
+    assert applies() == 0
+    assert {:ok, %{"n" => 200}} = Authority.content_at(pid, "e1", 200)
+
+    for revision <- 0..199 do
+      assert Authority.content_at(pid, "e1", revision) in [
+               {:ok, %{"n" => revision}},
+               {:error, :unknown_revision}
+             ]
+
+      assert applies() <= 127
+    end
+  end
+
+  @tag :capture_log
+  test "an engine that raises rebuilding a revision gives its reader an error, and the document goes on",
+       %{instance: instance} do
+    {:ok, fuse} = Agent.start_link(fn -> false end)
+    {_id, pid} = observed(instance, fuse: fuse)
+    {:ok, %{"epoch" => epoch}} = Authority.snapshot(pid)
+    for n <- 1..2, do: {:ok, _} = Authority.commit(pid, set_n(pid, n), "u")
+
+    Agent.update(fuse, fn _ -> true end)
+    assert {:error, :replay_failed} = Authority.content_at(pid, epoch, 1)
+
+    Agent.update(fuse, fn _ -> false end)
+    assert {:ok, %{"revision" => 3}} = Authority.commit(pid, set_n(pid, 3), "u")
   end
 
   test ":history is a number of transactions, at least 20" do
