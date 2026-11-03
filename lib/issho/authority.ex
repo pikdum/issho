@@ -36,6 +36,7 @@ defmodule Issho.Authority do
 
   use GenServer, restart: :temporary
 
+  alias Issho.Authority.Ledger
   alias Issho.{Config, Engine, Transaction}
 
   require Logger
@@ -143,6 +144,7 @@ defmodule Issho.Authority do
     with {:ok, loaded} <- store.load(context, id),
          {stored, spec} = initial(loaded, spec),
          {:ok, document} <- document(stored, engine, spec, engine_opts),
+         document = Ledger.load(document, config.history),
          {:ok, content} <- Engine.validate(engine, document["state"], engine_opts),
          :ok <- first_save(stored, store, context, id, document, content) do
       {:ok,
@@ -278,14 +280,8 @@ defmodule Issho.Authority do
     {:reply, replayed_content(state, epoch, revision), state}
   end
 
-  def handle_call({:accepted, ids, author}, _from, state) do
-    receipts = state.document["receipts"]
-
-    accepted =
-      for id <- List.wrap(ids), is_binary(id), get_in(receipts, [id, "author"]) == author, do: id
-
-    {:reply, accepted, state}
-  end
+  def handle_call({:accepted, ids, author}, _from, state),
+    do: {:reply, Ledger.accepted(state.document, ids, author), state}
 
   def handle_call({:commit, transaction, %Issho.Identity{} = by}, _from, state) do
     started = System.monotonic_time()
@@ -311,7 +307,7 @@ defmodule Issho.Authority do
 
     with :ok <- check(document, transaction),
          digest = Transaction.digest(transaction, author),
-         :new <- receipt(document, transaction["id"], digest),
+         :new <- Ledger.check(document, transaction, digest),
          :ok <- unchanged(document, transaction),
          {:ok, engine_state} <-
            state.engine.apply(document["state"], transaction["ops"], [
@@ -329,11 +325,11 @@ defmodule Issho.Authority do
         document
         |> Map.merge(%{"state" => engine_state, "revision" => revision})
         |> Map.update!("journal", &(&1 ++ [event]))
-        |> put_in(["receipts", transaction["id"]], %{
-          "digest" => digest,
-          "revision" => revision,
-          "author" => author
-        })
+        |> Ledger.record(
+          transaction["id"],
+          %{"digest" => digest, "revision" => revision, "author" => author},
+          state.config.history
+        )
 
       persist(state, next, content, event, by)
     else
@@ -442,18 +438,11 @@ defmodule Issho.Authority do
 
   # The document's version now, and what changed since the author saw it:
   # each change's revision and author (never its operations), the latest
-  # @changes, when the journal still holds them all.
+  # @changes whose receipts it keeps. Revisions are dense, so the count is
+  # exact; nil for another epoch.
   defp stale(document, %{"epoch" => epoch, "if_revision" => seen}) do
-    base = Map.get(document, "base", 0)
-
-    since =
-      if epoch == document["epoch"] and seen >= base,
-        do: Enum.drop(document["journal"], seen - base),
-        else: nil
-
-    changes =
-      for event <- Enum.take(since || [], -@changes),
-          do: %{"revision" => event["revision"], "author" => event["author"]}
+    count = if epoch == document["epoch"], do: document["revision"] - seen
+    changes = if count, do: Ledger.since(document, seen, @changes), else: []
 
     {:error,
      {:stale,
@@ -461,18 +450,10 @@ defmodule Issho.Authority do
         "version" => Issho.Version.of(document),
         "epoch" => document["epoch"],
         "revision" => document["revision"],
-        "count" => since && length(since),
+        "count" => count,
         "changes" => changes,
-        "complete" => since != nil and length(since) <= @changes
+        "complete" => count == length(changes)
       }}}
-  end
-
-  defp receipt(document, id, digest) do
-    case document["receipts"][id] do
-      nil -> :new
-      %{"digest" => ^digest, "revision" => revision} -> {:duplicate, revision}
-      _ -> {:error, :id_reused}
-    end
   end
 
   defp persist(state, next, content, event, by) do

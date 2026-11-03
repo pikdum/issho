@@ -28,6 +28,11 @@ defmodule Issho do
     * `:presence`: whether this instance starts `Issho.Presence` (`true`).
     * `:ttl`: how long, in milliseconds, an unused document stays open
       (30 seconds).
+    * `:history`: how many of a document's latest transactions it keeps
+      the receipts of, at least 20 (`nil`: every one). A retry of one of
+      them is answered with its revision again; a transaction made before
+      them without a receipt cannot be told from one already applied, and
+      is refused, `{:error, :expired}`, never applied twice.
     * `:awareness_interval`: milliseconds between awareness frames (50).
     * `:awareness_max_bytes`: the largest awareness state of a session, as
       JSON (64 KB).
