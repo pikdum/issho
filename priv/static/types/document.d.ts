@@ -15,10 +15,14 @@ export interface Snapshot {
     id: string;
     engine: string;
     epoch: string;
+    /** The epoch this one continues (a compaction): its transactions still apply. */
+    continues?: string;
     revision: number;
     state: State;
     accepted?: string[];
 }
+/** Whether a pending transaction can still go to a document at this snapshot: it is of its epoch, or of the one it continues. */
+export declare function carries(snapshot: Snapshot, transaction: Transaction): boolean;
 export interface Receipt {
     id: string;
     revision: number;
@@ -56,8 +60,8 @@ export interface DocumentOptions {
     persist?: (snapshot: Snapshot, pending: Transaction[]) => void;
     /**
      * Pending transactions kept from before (a draft), of the snapshot's
-     * epoch: those the snapshot's `accepted` does not name are replayed and
-     * sent.
+     * epoch or the one it continues: those the snapshot's `accepted` does
+     * not name are replayed and sent.
      */
     pending?: Transaction[];
     /**
@@ -116,7 +120,8 @@ export declare class SharedDocument {
     /**
      * The document as the server has it now, after a reconnect or when this
      * copy was out of step. `accepted` names pending transactions the server
-     * already has; the others are sent again, unchanged.
+     * already has, whatever their epoch; the others are sent again,
+     * unchanged, when they are of its epoch or the one it continues.
      */
     reset(snapshot: Snapshot): void;
     /** Whether the link can send; offline, transactions wait in the queue. */
