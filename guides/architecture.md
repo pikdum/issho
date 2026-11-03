@@ -41,7 +41,13 @@ Presence; a full frame every few seconds heals a missed one.
 ## Documents and engines
 
 An authority owns the envelope: the engine's name and version, an epoch,
-a revision, the state the epoch began with, the journal and the receipts.
+a revision, the journal of the latest transactions with the state it
+starts from, and the receipts. The journal rebuilds the revisions it
+holds, for a form that publishes the revision a person saw. The
+instance's `:journal` and `:history` bound how many transactions the
+journal and the receipts keep, and with `:compact`, a document no one has
+open sheds what only its past needed (a text's deleted characters) as a
+new epoch that continues the last. See `Issho.Authority`.
 The engine owns the state and its operations, and is pure, so the same
 operations give the same state on every node, in a replay, and in the
 browser's twin of the engine.
@@ -65,7 +71,8 @@ over the accepted state. A change shows at once; transactions go one at a
 time, never change once made, and are applied once however often they are
 sent. After a reconnect the room opens each document again with its
 pending ids, the server says which it already has, and only the others go
-again.
+again, on the epoch they were made on or one that continues it. A change
+refused for its epoch opens the document again.
 
 The engines come in pairs: `Issho.Engine.Map` and `mapEngine`, held to the
 same cases in `test/corpus`. A binding's engine does the same.

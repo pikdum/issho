@@ -24,10 +24,10 @@ defmodule Issho.Transaction do
   that revision of that epoch: when anyone changed it since, or it began
   a new epoch, the whole transaction is refused, before its operations or
   the document's hook run, with `{:error, {:stale, details}}`: the
-  document's version now, and the changes since (their revisions and
-  authors, the latest 20) when the journal still holds them. An agent
-  that read the document, then thought, changes what it read, or reads
-  it again (`Issho.Version`).
+  document's version now, how many changes it had since, and those
+  changes (their revisions and authors, the latest 20 whose receipts it
+  keeps; none for another epoch). An agent that read the document, then
+  thought, changes what it read, or reads it again (`Issho.Version`).
 
   The condition is part of what the transaction is: a retry of an
   accepted one gets its receipt even though the document went on; its id

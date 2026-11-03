@@ -15,15 +15,6 @@ defmodule Issho.Authority do
     4. saves the document and its content, comparing the stored version;
     5. only then answers the author and broadcasts the transaction.
 
-  The stored document is the engine's state with Issho's envelope: the
-  engine's name and version, an epoch, a revision, the state the epoch
-  began with, a journal of the accepted transactions, and their receipts.
-  The journal can rebuild any revision of the epoch (`content_at/3`), so a
-  form can publish exactly the revision a person saw. The current revision
-  needs no rebuilding: its content is the one the authority keeps. (An
-  upgraded document that kept no journal rebuilds the revisions from its
-  upgrade on.)
-
   A store that answers `{:error, :conflict}` means another process saved
   meanwhile (a node that lost touch with the cluster): this one stops, and
   the next open loads the newer document.
@@ -31,19 +22,77 @@ defmodule Issho.Authority do
   When no session has used the document for the instance's `:ttl` (30
   seconds), the authority stops; the document stays in the store.
 
-  With the instance's `:compact`, before it stops, when the document's
-  engine compacts (`c:Issho.Engine.compact/2`), the authority saves the
-  document again without what only its past needed (a text's deleted
-  characters), as a new epoch that continues this one: the same content,
-  revision and receipts, with a journal that starts from the compacted
-  state. A transaction made on the epoch it continues still applies,
-  unless it is only on the revision it saw (`"if_revision"`), which is
-  stale; one made on an epoch before that is refused, `:epoch_mismatch`,
-  unless the document applied it: a retry gets its receipt from any epoch.
-  It does so only when that saves at least a quarter of the state and
-  64 KB.
-
   Start an authority with `Issho.Documents.open/3`, not directly.
+
+  ## The stored document
+
+  The authority saves the engine's state inside Issho's envelope:
+
+      %{
+        "engine" => "kotoba",
+        "engine_version" => 3,
+        "epoch" => "9a0b…",
+        "revision" => 1649,
+        "state" => …,           # the engine's state at "revision"
+        "initial" => …,         # the engine's state at "base"
+        "base" => 1521,         # the journal starts after this revision
+        "journal" => [event],   # each transaction accepted since "base", oldest first
+        "receipts" => %{id => %{"digest" => …, "revision" => …, "author" => …}},
+        "horizon" => 649,       # each transaction accepted after it has a receipt
+        "continues" => "77c1…"  # after a compaction, the epoch this one continues
+      }
+
+  The journal holds `"revision"` minus `"base"` events. `content_at/4`
+  replays them from `"initial"`, each with its author, to rebuild any
+  revision from `"base"` to `"revision"` of the current epoch, so a form
+  can publish exactly the revision a person saw. Any other revision is
+  `{:error, :unknown_revision}`. The current revision needs no replay,
+  because the authority keeps its content.
+
+  Three options of the instance bound what a document keeps. Each is off
+  by default, and the document then keeps what Issho 0.5.0 keeps.
+
+    * `:journal` is how many transactions the journal keeps. Once the
+      journal is a quarter longer, the authority replays its oldest
+      transactions onto `"initial"` before the save and moves `"base"` on,
+      at most one more apply a commit. If that replay fails, the authority
+      logs it, keeps the journal, and commits all the same. A document
+      saved with a journal more than a quarter longer opens with its
+      journal starting at its current revision, with no replay.
+    * `:history` is how many receipts the document keeps. A retry of one
+      of those transactions gets its revision again. A transaction with no
+      receipt that was made on a revision before `"horizon"` may be one
+      whose receipt is gone, so the authority refuses it as
+      `{:error, :expired}` rather than apply it twice. An `"if_revision"`
+      one is stale, with the exact count of changes since and those whose
+      receipts are kept.
+    * `:compact` saves an idle document without what only its past needed
+      (a text's deleted characters), when its engine compacts
+      (`c:Issho.Engine.compact/2`). Before the authority stops, it saves
+      the compacted state as a new epoch whose `"continues"` names the
+      last, with the same content, revision, receipts and horizon, and a
+      journal that starts over from the compacted state. It does so only
+      when that saves at least a quarter of the state and 64 KB, and only
+      when the compacted state gives the same content. A transaction made
+      on the epoch the document continues still applies, unless it is an
+      `"if_revision"` one, which is stale. A transaction made on an epoch
+      before that is refused as `:epoch_mismatch`, unless the document has
+      its receipt: a retry gets its receipt from any epoch. Telemetry
+      `[:issho, :document, :compact]` reports each attempt.
+
+  A document saved without a journal opens with one that starts at its
+  current revision.
+
+  ## Issho 0.5.0 reads what this saves
+
+  Each key Issho 0.5.0 stores keeps its meaning, and `"horizon"` and
+  `"continues"` are new. 0.5.0 loads a document this version saves,
+  commits to it, and rebuilds the revisions its journal holds, so a deploy
+  can roll back. Two gaps remain. 0.5.0 ignores `"horizon"`, so after a
+  rollback, a retry of a transaction whose receipt `:history` dropped is
+  applied a second time. 0.5.0 also ignores `"continues"`, so it refuses a
+  transaction made on the epoch a compacted document continues, as it
+  refuses any other epoch's.
   """
 
   use GenServer, restart: :temporary

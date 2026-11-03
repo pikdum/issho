@@ -63,9 +63,10 @@ defmodule Issho.Test do
   end
 
   @doc """
-  Whether replaying a document's journal from the start of its epoch gives
-  its current content: the engine is deterministic, and nothing changed
-  the state outside a transaction. A conformance check for engines.
+  Whether replaying a document's journal from the state it starts from
+  (`"initial"`, at revision `"base"`) gives its current content: the
+  engine is deterministic, and nothing changed the state outside a
+  transaction. A conformance check for engines.
   """
   @spec replays?(atom(), String.t()) :: boolean()
   def replays?(instance, document_id) do

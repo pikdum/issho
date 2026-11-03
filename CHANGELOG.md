@@ -7,12 +7,71 @@ and Issho follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+A document can keep a bounded journal and bounded receipts, and an idle
+one can drop what only its past needed. Each is an instance option, off
+by default. A document keeps the shape Issho 0.5.0 stores, so 0.5.0
+loads, commits to and rebuilds the revisions of a document this version
+saves.
+
+Two gaps remain after a rollback to 0.5.0. It ignores `"horizon"`, so a
+retry of a transaction whose receipt `:history` dropped is applied a
+second time. It also ignores `"continues"`, so it refuses a transaction
+made on the epoch a compacted document continues, as `:epoch_mismatch`.
+
+### Added
+
+- `:journal`: how many transactions a document's journal keeps (`nil`,
+  every one, by default). Once the journal is a quarter longer, the
+  authority replays its oldest transactions onto `"initial"` before the
+  save and moves `"base"` on, at most one more apply a commit. Each
+  revision from `"base"` on still rebuilds (`Issho.content/4`). A document
+  saved with a journal more than a quarter longer opens with its journal
+  starting at its current revision, without a replay, and so does one
+  saved without a journal, whatever `:journal` is.
+- `:history`: how many receipts a document keeps (`nil`, every one, by
+  default; at least 20). The stored document's new `"horizon"` is the
+  revision after which every accepted transaction has a receipt. A
+  transaction with no receipt made on a revision before it is refused,
+  `{:error, :expired}`, rather than applied twice.
+- `:compact` (`false` by default) and an optional engine callback,
+  `c:Issho.Engine.compact/2`: the state without what only past operations
+  need (a text's deleted characters). When no session has had a document
+  open for the `:ttl`, its authority compacts it before it stops, and
+  saves it as a new epoch whose new `"continues"` key names the last, with
+  the same revision, receipts and content, and a journal that starts over
+  from the compacted state. It saves only when that frees at least a
+  quarter of the state and 64 KB, and only when the compacted state gives
+  the same content. Telemetry `[:issho, :document, :compact]` reports each
+  attempt. A binding delegates `compact/2` when its engine has it.
+- A transaction made on the epoch a document continues still applies, and
+  goes out on the document's epoch; an `"if_revision"` one is stale, with
+  an exact count. Snapshots carry `"continues"`, and the browser keeps
+  such pending transactions across the reset, and in a draft across a
+  reload.
+
+### Changed
+
+- Stale details give the exact count of changes since the revision seen,
+  even when the journal no longer holds them, and list the latest of them
+  whose receipts the document keeps.
+
 ### Fixed
 
 - `Issho.content/4` (and `Issho.Authority.content_at/3`) answers the
   current revision with the content the authority keeps, without replaying
   the journal. Publishing what a person saw replayed the whole epoch, so a
   form on a document with a long history took seconds and could time out.
+- An engine that raises rebuilding a revision gives the reader `{:error,
+  :replay_failed}`, and the document goes on. It stopped the document's
+  authority.
+- A retry of a transaction the document applied is answered with its
+  receipt whatever epoch it was made on, conditional or not.
+- On a reset to another epoch, the browser drops the pending transactions
+  the server says it accepted, and refuses only the rest. It refused them
+  all, so an editor froze over work that was saved.
+- A change refused as `"epoch_mismatch"` opens the document again. The
+  browser stayed on the epoch the server no longer had, and every later
+  change was refused the same way.
 
 ## [0.5.0] - 2026-10-26
 
