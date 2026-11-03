@@ -36,7 +36,7 @@ defmodule Issho.Authority do
 
   use GenServer, restart: :temporary
 
-  alias Issho.Authority.Ledger
+  alias Issho.Authority.{Journal, Ledger}
   alias Issho.{Config, Engine, Transaction}
 
   require Logger
@@ -144,7 +144,7 @@ defmodule Issho.Authority do
     with {:ok, loaded} <- store.load(context, id),
          {stored, spec} = initial(loaded, spec),
          {:ok, document} <- document(stored, engine, spec, engine_opts),
-         document = Ledger.load(document, config.history),
+         document = document |> Ledger.load(config.history) |> Journal.load(config.journal),
          {:ok, content} <- Engine.validate(engine, document["state"], engine_opts),
          :ok <- first_save(stored, store, context, id, document, content) do
       {:ok,
@@ -324,7 +324,8 @@ defmodule Issho.Authority do
       next =
         document
         |> Map.merge(%{"state" => engine_state, "revision" => revision})
-        |> Map.update!("journal", &(&1 ++ [event]))
+        |> Journal.append(event)
+        |> fold(state)
         |> Ledger.record(
           transaction["id"],
           %{"digest" => digest, "revision" => revision, "author" => author},
@@ -344,6 +345,21 @@ defmodule Issho.Authority do
 
       {:error, reason} ->
         {:error, reason, state}
+    end
+  end
+
+  # Past the instance's :journal, the oldest events fold into "initial",
+  # before the save, so the stored document stays bounded. A fold that
+  # fails (an engine that does not apply a transaction again as it did)
+  # leaves the journal as it was: the commit goes on.
+  defp fold(document, state) do
+    case Journal.fold(document, state.config.journal, &replay(state, &1, &2)) do
+      {:ok, folded} ->
+        folded
+
+      {:error, reason} ->
+        Logger.error("Issho: #{state.id} kept its journal unfolded: #{inspect(reason)}")
+        document
     end
   end
 
@@ -512,29 +528,29 @@ defmodule Issho.Authority do
   defp content_at_revision(state, epoch, revision), do: replayed_content(state, epoch, revision)
 
   defp replayed_content(state, epoch, revision) do
-    document = state.document
-    base = Map.get(document, "base", 0)
-
-    if epoch == document["epoch"] and is_integer(revision) and revision >= base and
-         revision <= document["revision"] do
-      # Each transaction as it was accepted: an engine may limit the
-      # operations of one.
-      events = Enum.take(document["journal"], revision - base)
-
-      with {:ok, engine_state} <- replay(state, document["initial"], events),
-           do: Engine.validate(state.engine, engine_state, state.opts)
-    else
-      {:error, :unknown_revision}
-    end
+    with {:ok, initial, events} <- Journal.rebuild(state.document, epoch, revision),
+         {:ok, engine_state} <- replay(state, initial, events),
+         do: Engine.validate(state.engine, engine_state, state.opts)
   end
 
-  defp replay(_state, engine_state, []), do: {:ok, engine_state}
+  # Each transaction as it was accepted, with its author: an engine may
+  # limit the operations of one. An engine that raises gives an error,
+  # and the document goes on.
+  defp replay(state, engine_state, events) do
+    Enum.reduce_while(events, {:ok, engine_state}, fn event, {:ok, acc} ->
+      case state.engine.apply(acc, event["ops"], [{:author, event["author"]} | state.opts]) do
+        {:ok, next} -> {:cont, {:ok, next}}
+        error -> {:halt, error}
+      end
+    end)
+  rescue
+    error ->
+      Logger.error(
+        "Issho: replaying the journal of #{state.id} raised: " <>
+          Exception.format(:error, error, __STACKTRACE__)
+      )
 
-  defp replay(state, engine_state, [event | rest]) do
-    opts = [{:author, event["author"]} | state.opts]
-
-    with {:ok, next} <- state.engine.apply(engine_state, event["ops"], opts),
-         do: replay(state, next, rest)
+      {:error, :replay_failed}
   end
 
   defp snapshot_of(state) do

@@ -33,6 +33,10 @@ defmodule Issho do
       them is answered with its revision again; a transaction made before
       them without a receipt cannot be told from one already applied, and
       is refused, `{:error, :expired}`, never applied twice.
+    * `:journal`: how many of a document's latest transactions it keeps
+      in its journal (`nil`: every one). Each revision from the oldest of
+      them on can be rebuilt (`Issho.Authority.content_at/4`); the older
+      fold into the state the journal starts from. See `Issho.Authority`.
     * `:awareness_interval`: milliseconds between awareness frames (50).
     * `:awareness_max_bytes`: the largest awareness state of a session, as
       JSON (64 KB).
