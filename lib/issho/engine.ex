@@ -16,7 +16,7 @@ defmodule Issho.Engine do
   any Erlang term: a struct of your own.
 
   Everything outside the engine treats operations as opaque: the authority,
-  the store, receipts and the offline queue see only a
+  the store, receipts, the journal and the offline queue see only a
   transaction's id, its base revision and its author.
 
   ## Callbacks
@@ -36,18 +36,12 @@ defmodule Issho.Engine do
       engine, or one saved before Issho in a library's own format, and
       gives its `"state"`, `"epoch"` and `"revision"`, and its
       `"receipts"` if it kept them. With an `"initial"` state and a
-      `"journal"` of fewer than 128 transactions since, those revisions
-      can be rebuilt. Keep the epoch and revision the store has, so that the
+      `"journal"` of the transactions since, earlier revisions can be
+      rebuilt. Keep the epoch and revision the store has, so that the
       first save after the upgrade finds the version it expects.
       The upgraded document is saved with the next transaction; until
       then the store keeps it as it was. Without it, such a document does
       not open.
-    * `c:compact/2` gives the state without what only past operations
-      need: a text's deleted characters, kept as anchors for changes made
-      before they were deleted. An idle document is saved compacted, as a
-      new epoch that continues the last (see `Issho.Authority`). Without
-      it, a document is never compacted; its receipts stay bounded all the
-      same.
   """
 
   @type state :: map()
@@ -77,26 +71,7 @@ defmodule Issho.Engine do
   @doc "A stored document of another version, or format, as this engine's."
   @callback upgrade(stored :: map()) :: {:ok, map()} | {:error, term()}
 
-  @doc """
-  The state without what only past operations need. Three promises, which
-  the authority relies on:
-
-    1. The same content: `c:validate/2` gives the same for both. The
-       authority checks it, and keeps the old state when it differs.
-    2. Everything that remains keeps its identity (a node's id, a
-       character's id, a list item's id), so places, comments and anchors
-       that name it still find it.
-    3. An operation made on the state before compaction (a transaction of
-       the epoch it continues, sent by a browser that was offline) either
-       applies as it would have, or names something that went and is
-       refused by `c:apply/3`: never applied somewhere else.
-
-  Pure, like the rest of the engine. Give the state unchanged when there
-  is nothing to drop; the authority compares sizes.
-  """
-  @callback compact(state(), opts :: keyword()) :: {:ok, state()} | {:error, term()}
-
-  @optional_callbacks validate: 2, snapshot: 1, upgrade: 1, compact: 2
+  @optional_callbacks validate: 2, snapshot: 1, upgrade: 1
 
   @doc false
   @spec validate(module(), state(), keyword()) :: {:ok, term()} | {:error, term()}
@@ -113,10 +88,6 @@ defmodule Issho.Engine do
   @doc false
   @spec upgrades?(module()) :: boolean()
   def upgrades?(engine), do: exports?(engine, :upgrade, 1)
-
-  @doc false
-  @spec compacts?(module()) :: boolean()
-  def compacts?(engine), do: exports?(engine, :compact, 2)
 
   defp exports?(module, name, arity),
     do: Code.ensure_loaded?(module) and function_exported?(module, name, arity)

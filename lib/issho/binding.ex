@@ -52,11 +52,6 @@ defmodule Issho.Binding do
         @impl Issho.Engine
         defdelegate upgrade(stored), to: engine
       end
-
-      if Issho.Engine.compacts?(engine) do
-        @impl Issho.Engine
-        defdelegate compact(state, opts), to: engine
-      end
     end
   end
 

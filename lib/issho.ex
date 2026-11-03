@@ -28,15 +28,6 @@ defmodule Issho do
     * `:presence`: whether this instance starts `Issho.Presence` (`true`).
     * `:ttl`: how long, in milliseconds, an unused document stays open
       (30 seconds).
-    * `:history`: how many of a document's latest transactions it keeps
-      the receipts of (1,000, at least 20). A retry of one of them is
-      answered with its revision again; a transaction made before them
-      without a receipt cannot be told from one already applied, and is
-      refused, `{:error, :expired}`, never applied twice.
-    * `:compact`: whether an idle document whose engine compacts
-      (`c:Issho.Engine.compact/2`) is saved without what only its past
-      needed, as a new epoch that continues the last (`true`). See
-      `Issho.Authority`.
     * `:awareness_interval`: milliseconds between awareness frames (50).
     * `:awareness_max_bytes`: the largest awareness state of a session, as
       JSON (64 KB).
@@ -149,10 +140,7 @@ defmodule Issho do
 
   @doc """
   The content of a document's revision, for a form that publishes exactly
-  what a person saw: the `epoch` and `revision` the browser posts. The
-  current revision, or one of the latest the document's authority keeps
-  (at least 128 since it started, `Issho.Authority`); `{:error,
-  :unknown_revision}` for another (ask the person to save again).
+  what a person saw: the `epoch` and `revision` the browser posts.
   `{:error, :timeout}` when the document's authority does not answer
   within the `:timeout` option, in milliseconds (5,000), and `{:error,
   :unavailable}` when it is gone: never an exit.

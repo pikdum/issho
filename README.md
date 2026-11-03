@@ -55,9 +55,9 @@ It gives your app:
   through the `Issho.Actor` protocol, with no user model of Issho's;
 * **documents** with one authority each across a cluster, which orders
   every change, applies it once (a retry gets its receipt), saves it with
-  your store, and only then confirms and broadcasts it; its latest
-  revisions can be read again, for forms that publish exactly what a
-  person saw;
+  your store, and only then confirms and broadcasts it; any revision of
+  an epoch can be read again, for forms that publish exactly what a person
+  saw;
 * **your tables as the truth** when you want them: a document's
   `:on_transaction` hook runs once for each accepted change, before
   anyone sees it, to save it (or refuse it), and a document with

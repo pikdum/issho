@@ -63,15 +63,17 @@ defmodule Issho.Test do
   end
 
   @doc """
-  Whether replaying a document's latest transactions, from the oldest
-  revision its authority keeps (up to 256 back), gives its current
-  content: the engine is deterministic, and nothing changed the state
-  outside a transaction. A conformance check for engines.
+  Whether replaying a document's journal from the start of its epoch gives
+  its current content: the engine is deterministic, and nothing changed
+  the state outside a transaction. A conformance check for engines.
   """
   @spec replays?(atom(), String.t()) :: boolean()
   def replays?(instance, document_id) do
     {:ok, pid} = Documents.open(instance, document_id)
-    {:ok, %{"content" => content}} = Authority.content(pid)
-    Authority.replay(pid) == {:ok, content}
+
+    {:ok, %{"epoch" => epoch, "revision" => revision, "content" => content}} =
+      Authority.content(pid)
+
+    Authority.replayed(pid, epoch, revision) == {:ok, content}
   end
 end

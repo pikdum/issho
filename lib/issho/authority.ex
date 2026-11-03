@@ -16,23 +16,13 @@ defmodule Issho.Authority do
     5. only then answers the author and broadcasts the transaction.
 
   The stored document is the engine's state with Issho's envelope: the
-  engine's name and version, an epoch, a revision, and the receipts of
-  its latest transactions (the instance's `:history`, 1,000). A retry of
-  one of them gets its revision again. A transaction with no receipt made
-  on a revision before them cannot be told from one whose receipt was
-  dropped: it is refused, `{:error, :expired}`, and never applied twice.
-  The document does not grow with its history; for a record of every
-  change, save each one from the document's `:on_transaction` hook.
-
-  The authority keeps its latest revisions in memory, and rebuilds any of
-  them from fewer than 128 transactions (`content_at/3`), so a form can
-  publish exactly the revision a person saw. It keeps at least the latest
-  128 accepted since it started, and at most 256; an older revision, or
-  one from before it started, is `{:error, :unknown_revision}`. The
-  current revision needs no rebuilding: its content is the one the
-  authority keeps. A document an earlier Issho saved with its journal
-  opens without it, and rebuilds that journal's revisions when it has
-  fewer than 128 transactions.
+  engine's name and version, an epoch, a revision, the state the epoch
+  began with, a journal of the accepted transactions, and their receipts.
+  The journal can rebuild any revision of the epoch (`content_at/3`), so a
+  form can publish exactly the revision a person saw. The current revision
+  needs no rebuilding: its content is the one the authority keeps. (An
+  upgraded document that kept no journal rebuilds the revisions from its
+  upgrade on.)
 
   A store that answers `{:error, :conflict}` means another process saved
   meanwhile (a node that lost touch with the cluster): this one stops, and
@@ -41,37 +31,16 @@ defmodule Issho.Authority do
   When no session has used the document for the instance's `:ttl` (30
   seconds), the authority stops; the document stays in the store.
 
-  Before it stops, when the document's engine compacts
-  (`c:Issho.Engine.compact/2`), the authority saves the document again
-  without what only its past needed (a text's deleted characters), as a
-  new epoch that continues this one: the same content, revision and
-  receipts. A transaction made on the epoch it continues still applies,
-  unless it is only on the revision it saw (`"if_revision"`), which is
-  stale; one made on an epoch before that is refused, `:epoch_mismatch`,
-  unless the document applied it: a retry gets its receipt from any epoch.
-  The authority compacts only when that saves at least a quarter of the
-  state and 64 KB, and the instance's `:compact` is true (the default).
-  Each try is a `[:issho, :document, :compact]` telemetry event:
-  measurements `:duration`, and `:bytes_before` and `:bytes_after` (the
-  state's external size), metadata `:instance`, `:document` and
-  `:result` (`:ok`, `:skipped` or `:error`).
-
   Start an authority with `Issho.Documents.open/3`, not directly.
   """
 
   use GenServer, restart: :temporary
 
-  alias Issho.Authority.{Ledger, Window}
   alias Issho.{Config, Engine, Transaction}
 
   require Logger
 
   @read_timeout 5_000
-
-  # A compaction is worth a new epoch when it saves at least this share
-  # of the state, and at least this many bytes.
-  @compact_share 4
-  @compact_bytes 65_536
 
   @doc false
   def start_link(opts) do
@@ -100,7 +69,7 @@ defmodule Issho.Authority do
 
   @doc """
   Commits a transaction of an author: its identity (`Issho.Identity`), or
-  only its key. The key is what its receipt keeps; the
+  only its key. The key is what the journal and the receipts keep; the
   identity, when given, is what the document's hook gets as `:by` (who
   made the change: a person, an agent and whom it acts for, a service).
   Gives `{:ok, %{"id" => id, "revision" => revision, "version" => token}}`
@@ -129,11 +98,10 @@ defmodule Issho.Authority do
   def content(server), do: read(server, :content)
 
   @doc """
-  The content of an accepted revision of the epoch: the current one, or
-  one of the latest it keeps; `{:error, :unknown_revision}` for another.
-  `{:error, :timeout}` when the authority does not answer within the
-  `:timeout` option, in milliseconds (5,000), and `{:error, :unavailable}`
-  when it is gone, rather than an exit.
+  The content of an accepted revision of the epoch. `{:error, :timeout}`
+  when the authority does not answer within the `:timeout` option, in
+  milliseconds (5,000), and `{:error, :unavailable}` when it is gone,
+  rather than an exit.
   """
   @spec content_at(GenServer.server(), String.t(), non_neg_integer(), keyword()) ::
           {:ok, term()} | {:error, term()}
@@ -141,10 +109,10 @@ defmodule Issho.Authority do
     do: read(server, {:content_at, epoch, revision}, Keyword.get(opts, :timeout, @read_timeout))
 
   @doc false
-  # Issho.Test.replays?/2: the latest revisions replayed from the oldest
-  # one the authority keeps, to its current content.
-  @spec replay(GenServer.server()) :: {:ok, term()} | {:error, term()}
-  def replay(server), do: read(server, :replay)
+  # Issho.Test.replays?/2: content_at/3 answers the current revision without a replay.
+  @spec replayed(GenServer.server(), String.t(), non_neg_integer()) ::
+          {:ok, term()} | {:error, term()}
+  def replayed(server, epoch, revision), do: read(server, {:replayed, epoch, revision})
 
   # commit/3 and join/2 exit instead: that ends the channel, and the
   # browser's rejoin resends its pending transactions, which receipts keep
@@ -175,8 +143,6 @@ defmodule Issho.Authority do
     with {:ok, loaded} <- store.load(context, id),
          {stored, spec} = initial(loaded, spec),
          {:ok, document} <- document(stored, engine, spec, engine_opts),
-         window = Window.load(document),
-         document = Ledger.load(document, config.history),
          {:ok, content} <- Engine.validate(engine, document["state"], engine_opts),
          :ok <- first_save(stored, store, context, id, document, content) do
       {:ok,
@@ -191,7 +157,6 @@ defmodule Issho.Authority do
          events: Map.get(spec, :events),
          document: document,
          content: content,
-         window: window,
          members: %{},
          timer: Process.send_after(self(), :expire, config.ttl)
        }}
@@ -214,6 +179,8 @@ defmodule Issho.Authority do
          "epoch" => Transaction.id(),
          "revision" => 0,
          "state" => state,
+         "initial" => state,
+         "journal" => [],
          "receipts" => %{}
        }}
     end
@@ -307,13 +274,18 @@ defmodule Issho.Authority do
     {:reply, content_at_revision(state, epoch, revision), state}
   end
 
-  def handle_call(:replay, _from, state) do
-    {engine_state, events} = Window.all(state.window)
-    {:reply, rebuild(state, engine_state, events), state}
+  def handle_call({:replayed, epoch, revision}, _from, state) do
+    {:reply, replayed_content(state, epoch, revision), state}
   end
 
-  def handle_call({:accepted, ids, author}, _from, state),
-    do: {:reply, Ledger.accepted(state.document, ids, author), state}
+  def handle_call({:accepted, ids, author}, _from, state) do
+    receipts = state.document["receipts"]
+
+    accepted =
+      for id <- List.wrap(ids), is_binary(id), get_in(receipts, [id, "author"]) == author, do: id
+
+    {:reply, accepted, state}
+  end
 
   def handle_call({:commit, transaction, %Issho.Identity{} = by}, _from, state) do
     started = System.monotonic_time()
@@ -337,9 +309,9 @@ defmodule Issho.Authority do
     document = state.document
     author = by.key
 
-    with :ok <- check(document, transaction, author),
+    with :ok <- check(document, transaction),
          digest = Transaction.digest(transaction, author),
-         :new <- Ledger.check(document, transaction, digest),
+         :new <- receipt(document, transaction["id"], digest),
          :ok <- unchanged(document, transaction),
          {:ok, engine_state} <-
            state.engine.apply(document["state"], transaction["ops"], [
@@ -348,32 +320,29 @@ defmodule Issho.Authority do
          {:ok, content} <- Engine.validate(state.engine, engine_state, state.opts),
          revision = document["revision"] + 1,
          :ok <- hook(state, transaction, by, engine_state, revision) do
-      # Of the document's epoch, whichever its author made it on (the one
-      # this continues): every browser applies it.
       event =
         transaction
-        |> Map.take(["id", "base_revision", "ops"])
-        |> Map.merge(%{"epoch" => document["epoch"], "revision" => revision, "author" => author})
+        |> Map.take(["id", "epoch", "base_revision", "ops"])
+        |> Map.merge(%{"revision" => revision, "author" => author})
 
       next =
         document
         |> Map.merge(%{"state" => engine_state, "revision" => revision})
-        |> Ledger.record(
-          transaction["id"],
-          %{"digest" => digest, "revision" => revision, "author" => author},
-          state.config.history
-        )
+        |> Map.update!("journal", &(&1 ++ [event]))
+        |> put_in(["receipts", transaction["id"]], %{
+          "digest" => digest,
+          "revision" => revision,
+          "author" => author
+        })
 
       persist(state, next, content, event, by)
     else
-      # Its version is of the epoch it was made on, which may be one this
-      # document continues.
       {:duplicate, revision} ->
         {:ok,
          %{
            "id" => transaction["id"],
            "revision" => revision,
-           "version" => Issho.Version.new(transaction["epoch"], revision),
+           "version" => Issho.Version.new(document["epoch"], revision),
            "duplicate" => true
          }, state}
 
@@ -450,36 +419,17 @@ defmodule Issho.Authority do
       )
   end
 
-  # The envelope's to refuse, but for a transaction of another epoch.
-  defp check(document, transaction, author) do
-    case Transaction.check(transaction, epoch(document, transaction), document["revision"]) do
-      {:error, :epoch_mismatch} -> other_epoch(document, transaction, author)
-      result -> result
+  # A conditional transaction from another epoch is stale, as one from
+  # an older revision is; anything else is the envelope's to refuse.
+  defp check(document, transaction) do
+    case Transaction.check(transaction, document["epoch"], document["revision"]) do
+      {:error, :epoch_mismatch} = error ->
+        if Transaction.conditional?(transaction), do: stale(document, transaction), else: error
+
+      result ->
+        result
     end
   end
-
-  # A retry of a transaction the document applied, made on any epoch, gets
-  # its receipt; a conditional one is stale, as one from an older revision
-  # is; anything else is refused.
-  defp other_epoch(document, transaction, author) do
-    case Ledger.check(document, transaction, Transaction.digest(transaction, author)) do
-      {:duplicate, _revision} = duplicate ->
-        duplicate
-
-      _other ->
-        if Transaction.conditional?(transaction),
-          do: stale(document, transaction),
-          else: {:error, :epoch_mismatch}
-    end
-  end
-
-  # The epoch a transaction is checked on: the document's, or the one it
-  # continues for an unconditional transaction made before a compaction.
-  defp epoch(%{"continues" => continued} = document, %{"epoch" => continued} = transaction) do
-    if Transaction.conditional?(transaction), do: document["epoch"], else: continued
-  end
-
-  defp epoch(document, _transaction), do: document["epoch"]
 
   # Only on the revision it saw: still the document's.
   defp unchanged(%{"revision" => revision}, %{"if_revision" => revision}), do: :ok
@@ -492,12 +442,18 @@ defmodule Issho.Authority do
 
   # The document's version now, and what changed since the author saw it:
   # each change's revision and author (never its operations), the latest
-  # @changes whose receipts it keeps. Revisions are dense, and go on across
-  # a compaction, so the count is exact; nil for another epoch.
+  # @changes, when the journal still holds them all.
   defp stale(document, %{"epoch" => epoch, "if_revision" => seen}) do
-    line? = epoch == document["epoch"] or (is_binary(epoch) and epoch == document["continues"])
-    count = if line? and seen <= document["revision"], do: document["revision"] - seen
-    changes = if count, do: Ledger.since(document, seen, @changes), else: []
+    base = Map.get(document, "base", 0)
+
+    since =
+      if epoch == document["epoch"] and seen >= base,
+        do: Enum.drop(document["journal"], seen - base),
+        else: nil
+
+    changes =
+      for event <- Enum.take(since || [], -@changes),
+          do: %{"revision" => event["revision"], "author" => event["author"]}
 
     {:error,
      {:stale,
@@ -505,10 +461,18 @@ defmodule Issho.Authority do
         "version" => Issho.Version.of(document),
         "epoch" => document["epoch"],
         "revision" => document["revision"],
-        "count" => count,
+        "count" => since && length(since),
         "changes" => changes,
-        "complete" => count == length(changes)
+        "complete" => since != nil and length(since) <= @changes
       }}}
+  end
+
+  defp receipt(document, id, digest) do
+    case document["receipts"][id] do
+      nil -> :new
+      %{"digest" => ^digest, "revision" => revision} -> {:duplicate, revision}
+      _ -> {:error, :id_reused}
+    end
   end
 
   defp persist(state, next, content, event, by) do
@@ -543,13 +507,7 @@ defmodule Issho.Authority do
            "id" => event["id"],
            "revision" => event["revision"],
            "version" => Issho.Version.new(next["epoch"], event["revision"])
-         },
-         %{
-           state
-           | document: next,
-             content: content,
-             window: Window.push(state.window, event, next["state"])
-         }}
+         }, %{state | document: next, content: content}}
 
       {:error, :conflict} ->
         Logger.warning("Issho: a newer #{state.id} was saved elsewhere; this authority stops")
@@ -570,34 +528,23 @@ defmodule Issho.Authority do
        ),
        do: {:ok, state.content}
 
-  defp content_at_revision(
-         %{document: %{"epoch" => epoch, "revision" => current}} = state,
-         epoch,
-         revision
-       )
-       when is_integer(revision) and revision < current do
-    case Window.plan(state.window, revision) do
-      {:ok, engine_state, events} -> rebuild(state, engine_state, events)
-      :error -> {:error, :unknown_revision}
+  defp content_at_revision(state, epoch, revision), do: replayed_content(state, epoch, revision)
+
+  defp replayed_content(state, epoch, revision) do
+    document = state.document
+    base = Map.get(document, "base", 0)
+
+    if epoch == document["epoch"] and is_integer(revision) and revision >= base and
+         revision <= document["revision"] do
+      # Each transaction as it was accepted: an engine may limit the
+      # operations of one.
+      events = Enum.take(document["journal"], revision - base)
+
+      with {:ok, engine_state} <- replay(state, document["initial"], events),
+           do: Engine.validate(state.engine, engine_state, state.opts)
+    else
+      {:error, :unknown_revision}
     end
-  end
-
-  defp content_at_revision(_state, _epoch, _revision), do: {:error, :unknown_revision}
-
-  # A revision from a checkpoint and the events after it, each transaction
-  # as it was accepted: an engine may limit the operations of one. An
-  # engine that raises gives the reader an error, and the document goes on.
-  defp rebuild(state, engine_state, events) do
-    with {:ok, engine_state} <- replay(state, engine_state, events),
-         do: Engine.validate(state.engine, engine_state, state.opts)
-  rescue
-    error ->
-      Logger.error(
-        "Issho: rebuilding a revision of #{state.id} raised: " <>
-          Exception.format(:error, error, __STACKTRACE__)
-      )
-
-      {:error, :replay_failed}
   end
 
   defp replay(_state, engine_state, []), do: {:ok, engine_state}
@@ -610,12 +557,13 @@ defmodule Issho.Authority do
   end
 
   defp snapshot_of(state) do
-    state.document
-    |> Map.take(["engine", "epoch", "continues", "revision"])
-    |> Map.merge(%{
+    %{
       "id" => state.id,
+      "engine" => state.document["engine"],
+      "epoch" => state.document["epoch"],
+      "revision" => state.document["revision"],
       "state" => Engine.snapshot(state.engine, state.document["state"])
-    })
+    }
   end
 
   @impl true
@@ -634,91 +582,10 @@ defmodule Issho.Authority do
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state),
     do: {:noreply, member_gone(%{state | members: Map.delete(state.members, pid)})}
 
-  def handle_info(:expire, %{members: members} = state) when map_size(members) == 0 do
-    if compacts?(state), do: compact(state)
-    {:stop, :normal, state}
-  end
+  def handle_info(:expire, %{members: members} = state) when map_size(members) == 0,
+    do: {:stop, :normal, state}
 
   def handle_info(:expire, state), do: {:noreply, state}
-
-  defp compacts?(state) do
-    state.config.compact and state.store != Issho.Store.None and Engine.compacts?(state.engine)
-  end
-
-  # The idle document, saved as a new epoch that continues this one,
-  # without what only its past needed. No session has it open, so no page
-  # holds pending work on this epoch but one that was away, whose
-  # transactions still apply. At most once an idle period: the authority
-  # stops right after.
-  defp compact(state) do
-    started = System.monotonic_time()
-    {result, sizes} = compaction(state)
-
-    :telemetry.execute(
-      [:issho, :document, :compact],
-      Map.put(sizes, :duration, System.monotonic_time() - started),
-      %{instance: state.config.name, document: state.id, result: result}
-    )
-  end
-
-  defp compaction(%{document: document} = state) do
-    case state.engine.compact(document["state"], state.opts) do
-      {:ok, compacted} ->
-        sizes = %{
-          bytes_before: :erlang.external_size(document["state"]),
-          bytes_after: :erlang.external_size(compacted)
-        }
-
-        {save_compacted(state, compacted, sizes), sizes}
-
-      {:error, reason} ->
-        Logger.warning("Issho: #{state.id} did not compact: #{inspect(reason)}")
-        {:error, %{}}
-    end
-  rescue
-    error ->
-      Logger.error(
-        "Issho: compacting #{state.id} raised: " <>
-          Exception.format(:error, error, __STACKTRACE__)
-      )
-
-      {:error, %{}}
-  end
-
-  # A store that answers :conflict has a newer document (saved from
-  # another node), or no longer takes this one: not an error.
-  defp save_compacted(%{document: document} = state, compacted, sizes) do
-    kept = state.content
-    next = %{document | "epoch" => Transaction.id(), "state" => compacted}
-    next = Map.put(next, "continues", document["epoch"])
-    expected = {document["epoch"], document["revision"]}
-
-    with :ok <- worth(sizes),
-         {:ok, ^kept} <- Engine.validate(state.engine, compacted, state.opts),
-         :ok <- state.store.save(state.context, state.id, expected, next, kept) do
-      :ok
-    else
-      :too_little ->
-        :skipped
-
-      {:error, :conflict} ->
-        :skipped
-
-      {:ok, _content} ->
-        Logger.error("Issho: #{state.id} compacted to other content; it is kept as it was")
-        :error
-
-      {:error, reason} ->
-        Logger.error("Issho: #{state.id} was not saved compacted: #{inspect(reason)}")
-        :error
-    end
-  end
-
-  defp worth(%{bytes_before: before, bytes_after: compacted}) do
-    if before - compacted >= max(div(before, @compact_share), @compact_bytes),
-      do: :ok,
-      else: :too_little
-  end
 
   # The last session gone: the document goes after the TTL, unless one comes.
   defp member_gone(%{members: members} = state) when map_size(members) == 0,
