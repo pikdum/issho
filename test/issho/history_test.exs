@@ -2,6 +2,7 @@ defmodule Issho.HistoryTest do
   # A document keeps the receipts of its latest transactions (the
   # instance's :history), not of every one: a transaction it can no longer
   # tell from one it applied is refused, :expired, and never applied twice.
+  # Its journal (the instance's :journal) stays as Issho 0.5.0 reads it.
   use ExUnit.Case, async: true
   use ExUnitProperties
 
@@ -22,19 +23,21 @@ defmodule Issho.HistoryTest do
     pubsub = :"Issho.HistoryTest.PubSub#{unique}"
     start_supervised!({Phoenix.PubSub, name: pubsub})
 
+    # {:history, :journal}
     instances =
-      Map.new([20, 27, nil], fn keep ->
-        {keep,
+      Map.new([{20, 4}, {27, 30}, {nil, nil}, {nil, 0}], fn {keep, cap} = limits ->
+        {limits,
          Issho.Test.start!(
            policy: Policy,
            pubsub: pubsub,
            history: keep,
+           journal: cap,
            store: {Store.Memory, store},
            ttl: 60_000
          )}
       end)
 
-    %{instance: instances[20], instances: instances, store: store}
+    %{instance: instances[{20, 4}], instances: instances, store: store}
   end
 
   # Each transaction counts, under its own id, how many times it applied.
@@ -151,14 +154,14 @@ defmodule Issho.HistoryTest do
 
   test "a document opened with a larger :history still refuses what a smaller one forgot",
        %{instances: instances} do
-    {id, pid} = open(instances[20])
+    {id, pid} = open(instances[{20, 4}])
     advance(pid, 75)
     t = tx(pid)
     {:ok, %{"revision" => 76}} = Authority.commit(pid, t, "user:ada")
     advance(pid, 25)
     :ok = GenServer.stop(pid)
 
-    {:ok, pid} = Documents.open(instances[27], id)
+    {:ok, pid} = Documents.open(instances[{27, 30}], id)
     assert {:error, :expired} = Authority.commit(pid, t, "user:ada")
     assert applied(pid, t) == 1
   end
@@ -214,12 +217,12 @@ defmodule Issho.HistoryTest do
 
   test "without :history, a document keeps every receipt, as Issho 0.5.0 does",
        %{instances: instances, store: store} do
-    {id, pid} = open(instances[nil])
+    {id, pid} = open(instances[{nil, nil}])
     old = tx(pid)
     {:ok, %{"revision" => 1}} = Authority.commit(pid, old, "user:ada")
     advance(pid, 99)
 
-    pid = reopen(instances[nil], id, pid)
+    pid = reopen(instances[{nil, nil}], id, pid)
     assert {:ok, %{"revision" => 1, "duplicate" => true}} = Authority.commit(pid, old, "user:ada")
 
     {:ok, %{"epoch" => epoch}} = Authority.snapshot(pid)
@@ -261,17 +264,27 @@ defmodule Issho.HistoryTest do
     ])
   end
 
-  property "a transaction applies at most once, and is refused only when older than :history",
+  property "a transaction applies at most once, is refused only when older than :history, and the journal replays",
            %{instances: instances, store: store} do
     check all(
-            keep <- member_of(Map.keys(instances)),
+            {keep, cap} = limits <- member_of(Map.keys(instances)),
             steps <- resize(list_of(step(), min_length: 200, max_length: 400), 400),
             max_runs: 30
           ) do
-      instance = instances[keep]
+      instance = instances[limits]
       {id, pid} = open(instance)
       {:ok, %{"epoch" => epoch}} = Authority.snapshot(pid)
-      start = %{instance: instance, id: id, epoch: epoch, keep: keep, pid: pid, revision: 0}
+
+      start = %{
+        instance: instance,
+        store: store,
+        id: id,
+        epoch: epoch,
+        keep: keep,
+        cap: cap,
+        pid: pid,
+        revision: 0
+      }
 
       model = Enum.reduce(steps, Map.put(start, :made, []), &run/2)
 
@@ -280,12 +293,35 @@ defmodule Issho.HistoryTest do
       assert revision == Enum.count(model.made, & &1.applied)
       assert state |> Map.get("n", %{}) |> Map.values() |> Enum.all?(&(&1 == 1))
 
-      {:ok, stored} = Store.Memory.load(store, id)
+      stored = assert_stored(model)
 
       if keep,
         do: assert(map_size(stored["receipts"]) <= keep + div(keep, 4)),
         else: assert(map_size(stored["receipts"]) == revision)
     end
+  end
+
+  # The stored document as Issho 0.5.0 reads it: a journal of the
+  # transactions after revision "base" (0 without one), which replays from
+  # "initial", each with its author, to the content; no longer than the
+  # instance's :journal and a quarter.
+  defp assert_stored(model) do
+    {:ok, stored} = Store.Memory.load(model.store, model.id)
+    base = Map.get(stored, "base", 0)
+    journal = stored["journal"]
+    assert length(journal) == stored["revision"] - base
+    if model.cap, do: assert(length(journal) <= model.cap + div(model.cap, 4))
+
+    replayed =
+      journal
+      |> Enum.take(stored["revision"] - base)
+      |> Enum.reduce(stored["initial"], fn event, state ->
+        {:ok, next} = Issho.Engine.Map.apply(state, event["ops"], author: event["author"])
+        next
+      end)
+
+    assert replayed == Store.Memory.content(model.store, model.id)
+    stored
   end
 
   defp run({:send, behind}, model) do
@@ -307,7 +343,10 @@ defmodule Issho.HistoryTest do
     %{model | made: List.replace_at(model.made, index, made)}
   end
 
-  defp run(:restart, model), do: %{model | pid: reopen(model.instance, model.id, model.pid)}
+  defp run(:restart, model) do
+    assert_stored(model)
+    %{model | pid: reopen(model.instance, model.id, model.pid)}
+  end
 
   # What the authority may answer, given what the transaction is: its
   # receipt is kept while it is one of the latest :history (all of them
