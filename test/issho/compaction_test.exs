@@ -57,6 +57,11 @@ defmodule Issho.CompactionTest do
     end
   end
 
+  defmodule TrashBinding do
+    @moduledoc false
+    use Issho.Binding, engine: Issho.CompactionTest.Trash
+  end
+
   @ttl 100
 
   setup do
@@ -355,6 +360,20 @@ defmodule Issho.CompactionTest do
     assert log =~ "compaction failed"
     assert_received {:compact, %{}, %{document: ^id, result: :error}}
     assert Store.Memory.load(store, id) == {:ok, before}
+  end
+
+  test "a document whose engine is a binding compacts as the binding's engine does",
+       %{instance: instance, store: store} do
+    {id, pid} = open(instance, engine: TrashBinding)
+    commit(pid, [set("title", "Plan"), throw_away(100_000)])
+    {:ok, %{"epoch" => epoch}} = Authority.snapshot(pid)
+
+    leave(pid)
+
+    assert_received :compact
+
+    assert {:ok, %{"continues" => ^epoch, "state" => %{"trash" => []}}} =
+             Store.Memory.load(store, id)
   end
 
   test "a document never compacts without :compact, without a store, or with an engine that cannot",
