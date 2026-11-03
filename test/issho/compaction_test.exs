@@ -121,14 +121,18 @@ defmodule Issho.CompactionTest do
     content
   end
 
-  defp telemetry do
+  # The compactions of these instances only: other tests compact meanwhile.
+  defp telemetry(instances) do
     ref = make_ref()
     test = self()
+    instances = List.wrap(instances)
 
     :telemetry.attach(
       ref,
       [:issho, :document, :compact],
-      fn _event, measurements, metadata, _ -> send(test, {:compact, measurements, metadata}) end,
+      fn _event, measurements, metadata, _ ->
+        if metadata.instance in instances, do: send(test, {:compact, measurements, metadata})
+      end,
       nil
     )
 
@@ -137,7 +141,7 @@ defmodule Issho.CompactionTest do
 
   test "an idle document is saved without its trash, as an epoch that continues the last",
        %{instance: instance, store: store} do
-    telemetry()
+    telemetry(instance)
     {id, pid} = open(instance)
     commit(pid, [set("title", "Plan")])
     commit(pid, [throw_away(100_000)])
@@ -317,7 +321,7 @@ defmodule Issho.CompactionTest do
 
   test "a compaction that saves less than 64 KB, or less than a quarter of the state, is not saved",
        %{instance: instance, store: store} do
-    telemetry()
+    telemetry(instance)
 
     for ops <- [
           [throw_away(10_000)],
@@ -350,7 +354,7 @@ defmodule Issho.CompactionTest do
 
   test "an engine that raises compacting leaves the document as it was, and stops",
        %{instance: instance, store: store} do
-    telemetry()
+    telemetry(instance)
     {id, pid} = open(instance, compact: :raise)
     commit(pid, [throw_away(100_000)])
     {:ok, before} = Store.Memory.load(store, id)
@@ -378,9 +382,9 @@ defmodule Issho.CompactionTest do
 
   test "a document never compacts without :compact, without a store, or with an engine that cannot",
        %{instance: instance} do
-    telemetry()
     pubsub = Config.get(instance).pubsub
     uncompacted = Issho.Test.start!(policy: Policy, pubsub: pubsub, ttl: @ttl)
+    telemetry([instance, uncompacted])
     {_id, pid} = open(uncompacted)
     commit(pid, [throw_away(100_000)])
     leave(pid)
