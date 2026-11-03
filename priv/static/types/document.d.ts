@@ -128,6 +128,7 @@ export declare class SharedDocument {
     setOnline(online: boolean): void;
     private joinLast;
     private newTransaction;
+    private rebaseLast;
     private endBatch;
     /** Resolves when every pending transaction has been accepted. */
     settled(): Promise<void>;
