@@ -72,6 +72,11 @@ made on the epoch a compacted document continues, as `:epoch_mismatch`.
 - A change refused as `"epoch_mismatch"` opens the document again. The
   browser stayed on the epoch the server no longer had, and every later
   change was refused the same way.
+- A batch stays open when the server accepts this browser's own
+  transaction before it, and takes that revision as its base. A person who
+  typed on through a round trip started a transaction with each change
+  from then on, and sent the one before at once, so a `batch` delay batched
+  nothing until they paused for it.
 
 ## [0.5.0] - 2026-10-26
 
